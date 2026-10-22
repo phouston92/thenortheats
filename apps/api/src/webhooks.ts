@@ -16,6 +16,8 @@ export async function webhookRoutes(app: FastifyInstance, db: Database) {
       try {
         const stripe = new StripeProvider().stripe;
         const secrets = [process.env.STRIPE_WEBHOOK_SECRET];
+        if (process.env.STRIPE_PLATFORM_WEBHOOK_SECRET)
+          secrets.push(process.env.STRIPE_PLATFORM_WEBHOOK_SECRET);
         if (
           process.env.STRIPE_WEBHOOK_SECRET_PREVIOUS &&
           Date.parse(process.env.STRIPE_WEBHOOK_PREVIOUS_EXPIRES_AT || "") >

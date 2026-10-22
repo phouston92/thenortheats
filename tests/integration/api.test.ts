@@ -2575,6 +2575,52 @@ describe("phase 3 order and billing scenarios", () => {
       )[0],
     ).toMatchObject({ charge_id: "ch_success_" + order, state: "captured" });
   });
+
+  it("accepts a separately signed platform fee event without a top-level connected-account field", async () => {
+    const order = await capturedCard(false),
+      charge = "ch_platform_" + order;
+    await db`UPDATE payments SET charge_id=${charge} WHERE order_id=${order}`;
+    process.env.STRIPE_PLATFORM_WEBHOOK_SECRET = "whsec_platform_fixture";
+    const payload = JSON.stringify({
+      id: crypto.randomUUID(),
+      type: "application_fee.refunded",
+      livemode: false,
+      created: Math.floor(Date.now() / 1000),
+      data: {
+        object: {
+          id: "fee_platform_" + order,
+          account: "acct_fixture",
+          charge,
+          amount: 100,
+          amount_refunded: 25,
+          currency: "gbp",
+        },
+      },
+    });
+    try {
+      const result = await app.inject({
+        method: "POST",
+        url: "/api/webhooks/stripe",
+        remoteAddress: scenarioIp,
+        headers: {
+          "content-type": "application/json",
+          "stripe-signature": Stripe.webhooks.generateTestHeaderString({
+            payload,
+            secret: process.env.STRIPE_PLATFORM_WEBHOOK_SECRET,
+          }),
+        },
+        payload,
+      });
+      expect(result.statusCode).toBe(200);
+      expect(
+        (
+          await db`SELECT amount_refunded FROM provider_application_fees WHERE order_id=${order}`
+        )[0].amount_refunded,
+      ).toBe(25);
+    } finally {
+      delete process.env.STRIPE_PLATFORM_WEBHOOK_SECRET;
+    }
+  });
   it("rotation re-encrypts legacy MFA atomically and revokes sessions without exposing plaintext", async () => {
     const headers = await session("admin", "key-rotation@test.local"),
       [u] =
