@@ -1,0 +1,60 @@
+name: Development quality gates
+on: [push, pull_request]
+jobs:
+  validate:
+    # Match the pinned Playwright release's supported Ubuntu LTS during runner rollouts.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17.7-alpine
+        env:
+          POSTGRES_USER: north
+          POSTGRES_PASSWORD: north_dev_only
+          POSTGRES_DB: north_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U north -d north_test"
+          --health-interval 5s --health-retries 20
+      redis:
+        image: redis:7.4.7-alpine
+        ports: ["6379:6379"]
+    env:
+      DATABASE_URL: postgres://north:north_dev_only@localhost:5432/north_test
+      TEST_DATABASE_URL: postgres://north:north_dev_only@localhost:5432/north_test
+      REDIS_URL: redis://localhost:6379
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck && pnpm typecheck:mobile && pnpm lint && pnpm test
+      - run: pnpm db:migrate && pnpm db:migrate && pnpm db:seed && pnpm db:seed
+      - run: pnpm test:integration
+      - run: pnpm build
+      - run: pnpm --filter @north/customer-mobile export
+        env:
+          EXPO_NO_TELEMETRY: 1
+      - run: pnpm exec playwright install --with-deps chromium
+        timeout-minutes: 10
+      - run: pnpm test:browser
+      - run: pnpm build:backend && pnpm audit:backend
+      - run: docker build -f infrastructure/docker/backend.Dockerfile -t north-backend:ci .
+      - run: docker run --rm --entrypoint node -v "$PWD/scripts/verify-backend.mjs:/verify-backend.mjs:ro" north-backend:ci /verify-backend.mjs
+      - run: pnpm test:backend-image
+      - run: docker build --target migration -f infrastructure/docker/backend.Dockerfile -t north-migrator:ci .
+      - run: docker run --rm --network=host -e DATABASE_URL -e NODE_ENV north-migrator:ci
+      - run: docker builder prune --all --force
+      - run: docker build -f infrastructure/docker/web.Dockerfile -t north-web:ci .
+      - run: docker run --rm --entrypoint node -v "$PWD/scripts/verify-web.mjs:/verify-web.mjs:ro" north-web:ci /verify-web.mjs
+      - run: pnpm test:web-image
+      - run: docker builder prune --all --force
+      - run: pnpm test:staging-config
+      - run: pnpm test:restore
+      - run: pnpm audit --audit-level high

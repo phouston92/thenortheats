@@ -1,0 +1,80 @@
+{
+  "name": "the-north-eats",
+  "private": true,
+  "packageManager": "pnpm@10.28.2",
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run --exclude 'tests/integration/**'",
+    "test:integration": "vitest run tests/integration",
+    "test:browser": "playwright test",
+    "build": "pnpm -r --if-present build",
+    "dev:api": "tsx watch --env-file-if-exists=.env apps/api/src/server.ts",
+    "dev:admin": "pnpm --filter @north/platform-admin dev",
+    "dev:partner": "pnpm --filter @north/partner-portal dev",
+    "dev:web": "pnpm --filter @north/customer-web dev",
+    "dev:mobile": "pnpm --filter @north/customer-mobile start",
+    "dev:worker": "tsx --env-file-if-exists=.env apps/worker/src/index.ts",
+    "db:migrate": "tsx --env-file-if-exists=.env packages/database/src/migrate.ts",
+    "db:seed": "tsx --env-file-if-exists=.env packages/database/src/seed.ts",
+    "services": "docker compose up -d --wait",
+    "setup:local": "tsx scripts/setup-local.ts",
+    "dev:mail": "tsx --env-file-if-exists=.env scripts/dev-auth.ts mail",
+    "dev:mfa": "tsx --env-file-if-exists=.env scripts/dev-auth.ts mfa",
+    "typecheck:mobile": "pnpm --filter @north/customer-mobile exec tsc --noEmit",
+    "dev": "tsx scripts/dev.ts",
+    "build:backend": "node scripts/build-backend.mjs",
+    "audit:backend": "node scripts/audit-backend.mjs",
+    "admin:mfa": "tsx --env-file-if-exists=.env scripts/admin-mfa.ts",
+    "test:backend-image": "tsx scripts/test-backend-image.ts",
+    "admin:rotate-key": "tsx --env-file-if-exists=.env scripts/rotate-mfa-key.ts",
+    "stripe:verify": "tsx --env-file-if-exists=.env scripts/stripe-verify.ts",
+    "test:restore": "tsx scripts/test-restore.ts",
+    "test:web-image": "node scripts/test-web-image.mjs",
+    "test:staging-config": "node scripts/test-staging-config.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "tsx": "4.23.15",
+    "vitest": "4.1.12",
+    "@types/node": "22.19.7",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "eslint": "9.39.2",
+    "typescript-eslint": "8.53.1",
+    "@playwright/test": "1.58.0",
+    "@axe-core/playwright": "4.11.0",
+    "esbuild": "0.28.2"
+  },
+  "dependencies": {
+    "fastify": "5.12.7",
+    "@fastify/cors": "11.2.0",
+    "@fastify/cookie": "11.0.2",
+    "@fastify/rate-limit": "10.3.0",
+    "@fastify/helmet": "13.0.2",
+    "@fastify/swagger": "9.6.1",
+    "fastify-raw-body": "5.0.0",
+    "zod": "4.3.5",
+    "drizzle-orm": "0.45.4",
+    "postgres": "3.4.8",
+    "bullmq": "5.66.5",
+    "ioredis": "5.9.2",
+    "stripe": "20.2.0",
+    "otpauth": "9.4.1",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "lucide-react": "0.562.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "postcss": "8.5.23",
+      "sharp": "0.35.5",
+      "image-size": "2.0.3",
+      "bullmq>uuid": "11.1.1"
+    }
+  },
+  "type": "module"
+}

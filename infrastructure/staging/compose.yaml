@@ -1,0 +1,147 @@
+# Preparation only. Never run against a VPS without separate deployment authorisation.
+name: north-staging
+x-backend: &backend
+  image: ${BACKEND_IMAGE:?Set a reviewed immutable image digest}
+  read_only: true
+  user: "1000:1000"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: ["/tmp:size=16m,mode=1777"]
+  restart: unless-stopped
+  networks: [private]
+  environment: &runtime
+    NODE_ENV: production
+    NORTH_INSTANCE: north-staging
+    COOKIE_SECURE: "true"
+    PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?HTTPS customer origin required}
+    PARTNER_PORTAL_ORIGIN: ${PARTNER_PORTAL_ORIGIN:?HTTPS partner origin required}
+    ADMIN_PORTAL_ORIGIN: ${ADMIN_PORTAL_ORIGIN:?HTTPS admin origin required}
+    TRUST_PROXY_CIDRS: 172.30.92.10/32
+    DATABASE_URL_FILE: /run/secrets/runtime_database_url
+    REDIS_URL_FILE: /run/secrets/redis_url
+    MFA_ENCRYPTION_KEYS_FILE: /run/secrets/mfa_keys
+    MFA_ACTIVE_KEY_ID_FILE: /run/secrets/mfa_active_key
+    MAIL_WEBHOOK_URL_FILE: /run/secrets/mail_webhook_url
+    MONITORING_TOKEN_FILE: /run/secrets/monitoring_token
+  secrets:
+    [
+      runtime_database_url,
+      redis_url,
+      mfa_keys,
+      mfa_active_key,
+      mail_webhook_url,
+      monitoring_token,
+    ]
+services:
+  api:
+    <<: *backend
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  worker:
+    <<: *backend
+    command: [worker]
+    healthcheck:
+      # API exposes heartbeat/queue health to the private monitor; never probe worker as HTTP.
+      disable: true
+    depends_on:
+      api: { condition: service_healthy }
+  postgres:
+    image: postgres:17.7-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: north_migrator
+      POSTGRES_DB: north_staging
+      POSTGRES_PASSWORD_FILE: /run/secrets/migration_password
+    secrets: [migration_password]
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    networks: [private]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U north_migrator -d north_staging"]
+      interval: 10s
+      retries: 10
+  redis:
+    user: "1000:1000"
+    image: redis:7.4.7-alpine
+    restart: unless-stopped
+    entrypoint: [/bin/sh, -ec]
+    # redis.conf includes ACL credentials via secret mount, never process arguments.
+    command: ["exec redis-server /run/secrets/redis_config"]
+    volumes: [redis_data:/data]
+    networks: [private]
+    healthcheck:
+      test:
+        [
+          CMD-SHELL,
+          "redis-cli --user health --no-auth-warning --askpass ping < /run/secrets/redis_health_password | grep -q PONG",
+        ]
+      interval: 10s
+      retries: 10
+    secrets:
+      - redis_config
+      - redis_health_password
+  edge:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      CUSTOMER_HOST: ${CUSTOMER_HOST:?Required}
+      PARTNER_HOST: ${PARTNER_HOST:?Required}
+      ADMIN_HOST: ${ADMIN_HOST:?Required}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${PORTAL_ARTIFACTS:?Reviewed portal build directory}:/srv/portals:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      private: { ipv4_address: 172.30.92.10 }
+      public: {}
+  web:
+    image: ${WEB_IMAGE:?Reviewed isolated Next image digest required}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    user: "1000:1000"
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      COOKIE_SECURE: "true"
+      API_ORIGIN: http://api:3001
+    networks: [private]
+  monitor:
+    user: "1000:1000"
+    image: prom/prometheus:v3.7.3
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - monitoring_data:/prometheus
+    secrets: [monitoring_token]
+    networks: [private]
+    # No public host port. Attach authenticated alert routing in a separately authorised release.
+networks:
+  private:
+    ipam:
+      config: [{ subnet: 172.30.92.0/24 }]
+  public: {}
+volumes:
+  postgres_data: {}
+  redis_data: {}
+  caddy_data: {}
+  caddy_config: {}
+  monitoring_data: {}
+secrets:
+  runtime_database_url:
+    { file: "${SECRETS_DIR:?Private secret directory}/runtime_database_url" }
+  migration_password: { file: "${SECRETS_DIR}/migration_password" }
+  redis_url: { file: "${SECRETS_DIR}/redis_url" }
+  redis_config: { file: "${SECRETS_DIR}/redis_config" }
+  redis_health_password: { file: "${SECRETS_DIR}/redis_health_password" }
+  mfa_keys: { file: "${SECRETS_DIR}/mfa_keys" }
+  mfa_active_key: { file: "${SECRETS_DIR}/mfa_active_key" }
+  mail_webhook_url: { file: "${SECRETS_DIR}/mail_webhook_url" }
+  monitoring_token: { file: "${SECRETS_DIR}/monitoring_token" }
+# Stripe intentionally absent. A separately reviewed TEST-ONLY overlay is needed for provider tests.

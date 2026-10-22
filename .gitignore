@@ -147,3 +147,15 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Development artifacts
+playwright-report/
+test-results/
+*.tsbuildinfo
+.expo/
+
+# Separate Next development and build outputs
+.next-dev/
+next-env.d.ts
+
+.next-browser/

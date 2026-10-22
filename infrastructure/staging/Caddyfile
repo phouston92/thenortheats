@@ -1,0 +1,40 @@
+(common) {
+ header {
+  Strict-Transport-Security "max-age=31536000"
+  X-Content-Type-Options nosniff
+  Referrer-Policy no-referrer
+  Permissions-Policy "camera=(), microphone=(), geolocation=()"
+  X-Frame-Options DENY
+ }
+ handle /internal/* {
+  respond 404
+ }
+ handle /api/* {
+  reverse_proxy api:3001
+ }
+}
+{$CUSTOMER_HOST} {
+ import common
+ handle {
+  reverse_proxy web:3000
+ }
+}
+{$PARTNER_HOST} {
+ import common
+ handle {
+  header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'"
+  root * /srv/portals/partner
+  try_files {path} /index.html
+  file_server
+ }
+}
+{$ADMIN_HOST} {
+ import common
+ handle {
+  header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'"
+  header Cache-Control no-store
+  root * /srv/portals/admin
+  try_files {path} /index.html
+  file_server
+ }
+}

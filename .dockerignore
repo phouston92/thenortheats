@@ -1,0 +1,14 @@
+.git
+**/node_modules
+**/.next*
+**/dist
+.env
+.env.*
+!.env.example
+playwright-report
+test-results
+
+**/*.tsbuildinfo
+**/next-env.d.ts
+**/.expo
+**/.vite
