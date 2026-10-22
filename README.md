@@ -14,7 +14,15 @@ pnpm db:migrate
 pnpm db:seed
 ```
 
-`setup:local` creates a private, ignored `.env` with a randomly generated development MFA secret; an existing file is preserved. Seed is repeatable and creates four towns, two pending demonstration partners and, when `SEED_ADMIN_EMAIL` is present, the local admin account. It never supplies an approved partner policy or activates a partner automatically. The local Docker database password is for isolated development only.
+`setup:local` creates a private, ignored `.env` with a randomly generated MFA encryption key; an existing file is preserved. Seed is repeatable and creates four towns, two pending demonstration partners and, when `SEED_ADMIN_EMAIL` is present, the local admin account. It never supplies an approved partner policy or activates a partner automatically. The local Docker database password is for isolated development only.
+
+After migration and seed, enroll the local administrator once:
+
+```bash
+pnpm admin:mfa admin@example.test /tmp/north-admin-enrollment.json
+```
+
+Import that private file into an authenticator, then delete it. Existing checkouts need a new, randomly generated 64-hex `MFA_ENCRYPTION_KEY` in their private `.env`; the old shared `ADMIN_MFA_SECRET` is no longer accepted. The operator command refuses to overwrite an enrolled credential; subsequent rotation and recovery codes are managed under administration → Platform Settings.
 
 Run `pnpm dev` to start the API, worker and three web apps together, or run each process in a separate terminal:
 
@@ -36,7 +44,7 @@ Ports describe local development; no public preview or deployment is created. Se
 3. In Partners, approve a policy explicitly. For the launch model enter 100 pence completed-order fee, 100 pence customer service fee, zero commission. VAT zero is an **unconfirmed test setting**, not tax advice. Leave tax confirmation unchecked until an accountant has approved treatment. Activate the partner only after policy approval.
 4. In Users and Permissions, assign an owner email to that partner. The partner user signs into the independent portal using email OTP.
 5. Browse the customer site, choose Lancaster or Morecambe, select the activated partner and place a cash collection order. Advance it in the partner portal. Tracking updates from the real API.
-6. The completed cash order generates two unique £1 ledger entries. A card order generates only the partner fee in weekly billing; the customer fee is allocated via the test Stripe adapter, not billed twice. Card checkout UI is not implemented.
+6. The completed cash order generates two unique £1 ledger entries. A card order generates only the partner fee in weekly billing; the customer fee is allocated via the test Stripe adapter, not billed twice. Stripe test card UI and partner onboarding are implemented; they require privately configured test credentials and have not been verified against Stripe. See [payments](docs/payments.md).
 
 ## Validation
 
@@ -54,6 +62,8 @@ NEXT_TELEMETRY_DISABLED=1 pnpm build
 pnpm exec playwright install --with-deps chromium
 pnpm test:browser
 pnpm --filter @north/customer-mobile export
+pnpm build:backend
+pnpm audit:backend  # isolated runtime only; does not replace the repository audit
 pnpm audit --audit-level high
 ```
 
@@ -62,3 +72,5 @@ When an existing system Chromium is available, `CHROMIUM_PATH=/usr/bin/chromium 
 See [development results](docs/development-progress.md), [requirements coverage](docs/requirements-coverage.md), [open decisions](docs/open-decisions.md) and [security](docs/security.md). The dependency audit currently fails on two high-severity Expo tooling advisories without published fixes (plus one moderate finding); no exceptions are hidden in CI.
 
 Review follow-up: [PR #1 stabilisation report](docs/stabilization-review.md). Access-change migrations revoke existing sessions once; run migrations before starting the updated API.
+
+Current follow-up: [payment/security/isolation report](docs/payment-security-review.md). Backend production-semantics image build and restricted-login smoke instructions are in [deployment](docs/deployment.md); no deployment is authorised.

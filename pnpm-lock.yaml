@@ -3,6 +3,7 @@ lockfileVersion: "9.0"
 settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
+  injectWorkspacePackages: true
 
 overrides:
   postcss: 8.5.23
@@ -80,6 +81,9 @@ importers:
       "@types/react-dom":
         specifier: 19.2.3
         version: 19.2.3(@types/react@19.2.7)
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
       eslint:
         specifier: 9.39.2
         version: 9.39.2
@@ -96,7 +100,50 @@ importers:
         specifier: 4.1.12
         version: 4.1.12(@types/node@22.19.7)(vite@6.4.4(@types/node@22.19.7)(lightningcss@1.33.0)(terser@5.51.2)(tsx@4.23.15)(yaml@2.9.1))
 
-  apps/api: {}
+  apps/api:
+    dependencies:
+      "@fastify/cookie":
+        specifier: 11.0.2
+        version: 11.0.2
+      "@fastify/cors":
+        specifier: 11.2.0
+        version: 11.2.0
+      "@fastify/helmet":
+        specifier: 13.0.2
+        version: 13.0.2
+      "@fastify/rate-limit":
+        specifier: 10.3.0
+        version: 10.3.0
+      "@fastify/swagger":
+        specifier: 9.6.1
+        version: 9.6.1
+      bullmq:
+        specifier: 5.66.5
+        version: 5.66.5
+      drizzle-orm:
+        specifier: 0.45.4
+        version: 0.45.4(postgres@3.4.8)
+      fastify:
+        specifier: 5.12.7
+        version: 5.12.7
+      fastify-raw-body:
+        specifier: 5.0.0
+        version: 5.0.0
+      ioredis:
+        specifier: 5.9.2
+        version: 5.9.2
+      otpauth:
+        specifier: 9.4.1
+        version: 9.4.1
+      postgres:
+        specifier: 3.4.8
+        version: 3.4.8
+      stripe:
+        specifier: 20.2.0
+        version: 20.2.0(@types/node@22.19.7)
+      zod:
+        specifier: 4.3.5
+        version: 4.3.5
 
   apps/customer-mobile:
     dependencies:
@@ -121,6 +168,9 @@ importers:
 
   apps/customer-web:
     dependencies:
+      "@stripe/stripe-js":
+        specifier: 10.1.0
+        version: 10.1.0
       next:
         specifier: 15.5.28
         version: 15.5.28(@playwright/test@1.58.0)(@types/node@22.19.7)(babel-plugin-react-compiler@1.0.0)(react-dom@19.2.3(react@19.2.3))(react@19.2.3)
@@ -2692,6 +2742,13 @@ packages:
       {
         integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==,
       }
+
+  "@stripe/stripe-js@10.1.0":
+    resolution:
+      {
+        integrity: sha512-sLRPukMKMxvRVrgV3Za8LM0Yd2azrixQjfaiuzS8Fivlu/Gt7VbBuRiRZJIvfL3XxAw+FdfdmhHSvjAfLG3lkA==,
+      }
+    engines: { node: ">=12.16" }
 
   "@swc/helpers@0.5.15":
     resolution:
@@ -9077,6 +9134,8 @@ snapshots:
       "@sinonjs/commons": 3.0.1
 
   "@standard-schema/spec@1.1.0": {}
+
+  "@stripe/stripe-js@10.1.0": {}
 
   "@swc/helpers@0.5.15":
     dependencies:

@@ -41,4 +41,8 @@ jobs:
           EXPO_NO_TELEMETRY: 1
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:browser
+      - run: pnpm build:backend && pnpm audit:backend
+      - run: docker build -f infrastructure/docker/backend.Dockerfile -t north-backend:ci .
+      - run: docker run --rm --entrypoint node -v "$PWD/scripts/verify-backend.mjs:/verify-backend.mjs:ro" north-backend:ci /verify-backend.mjs
+      - run: pnpm test:backend-image
       - run: pnpm audit --audit-level high

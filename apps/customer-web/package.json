@@ -8,6 +8,7 @@
   "dependencies": {
     "next": "15.5.28",
     "react": "19.2.3",
-    "react-dom": "19.2.3"
+    "react-dom": "19.2.3",
+    "@stripe/stripe-js": "10.1.0"
   }
 }

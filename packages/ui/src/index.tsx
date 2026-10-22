@@ -42,6 +42,7 @@ export function Login({
             ...challenge,
             code: data.get("code"),
             mfa: data.get("mfa") || undefined,
+            recoveryCode: data.get("recoveryCode") || undefined,
           }),
         });
         setCsrf(result.csrf);
@@ -90,6 +91,14 @@ export function Login({
               <label>
                 Authenticator code (administrators)
                 <input name="mfa" inputMode="numeric" pattern="[0-9]{6}" />
+              </label>
+              <label>
+                Recovery code (instead of authenticator)
+                <input
+                  name="recoveryCode"
+                  autoComplete="off"
+                  pattern="[a-f0-9]{32}"
+                />
               </label>
             </>
           )}

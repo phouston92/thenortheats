@@ -1,3 +1,4 @@
+import { MfaManagement } from "./mfa-management";
 import React, { useState, useEffect, useCallback } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -1081,13 +1082,14 @@ function App() {
                     require an authenticator code at sign-in.
                   </p>
                   <p className="notice">
-                    Custom roles, administrator provisioning, per-user MFA
-                    enrolment, and delegated support access are not implemented.
-                    There is no impersonation endpoint.
+                    Custom roles, administrator provisioning, delegated support
+                    access are not implemented. Per-user MFA is managed under
+                    Platform Settings. There is no impersonation endpoint.
                   </p>
                 </div>
               </section>
             )}
+            {page === "Platform Settings" && <MfaManagement />}
             {["Promotions", "Platform Settings"].includes(page) && (
               <section className="panel">
                 <Empty

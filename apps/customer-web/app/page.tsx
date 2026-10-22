@@ -1,5 +1,6 @@
 "use client";
 import React, { useState, useEffect } from "react";
+import { CardPayment } from "./card-payment";
 import {
   Login,
   useSession,
@@ -11,6 +12,7 @@ import {
 import { api } from "../../../packages/ui/src/api";
 export default function Home() {
   const { user, setUser } = useSession();
+  const [payment, setPayment] = useState<any>(null);
   const [page, setPage] = useState("discover");
   const [towns, setTowns] = useState<any[]>([]);
   const [town, setTown] = useState("Lancaster");
@@ -30,8 +32,18 @@ export default function Home() {
     api("/towns")
       .then(setTowns)
       .catch((e) => setError(e.message));
-    const saved = localStorage.getItem("north-last-order");
-    if (saved) setOrderId(saved);
+    const params = new URLSearchParams(window.location.search);
+    const returned = params.get("payment_return");
+    const saved =
+      returned && localStorage.getItem("north-order-" + returned)
+        ? returned
+        : localStorage.getItem("north-last-order");
+    if (saved) {
+      setOrderId(saved);
+      if (returned) setPage("tracking");
+    }
+    // Stripe redirects can append client-secret parameters; remove them promptly.
+    if (returned) window.history.replaceState({}, "", window.location.pathname);
   }, []);
   useEffect(() => {
     setError("");
@@ -106,7 +118,7 @@ export default function Home() {
           customerName: f.get("name"),
           customerEmail: f.get("email"),
           fulfilment,
-          paymentMethod: "cash",
+          paymentMethod: f.get("payment"),
           address:
             fulfilment === "delivery"
               ? { line1: f.get("address"), postcode: f.get("postcode") }
@@ -117,8 +129,17 @@ export default function Home() {
       localStorage.setItem("north-last-order", result.id);
       setOrderId(result.id);
       setOrder(null);
-      setBasket({});
-      setPage("tracking");
+      if (f.get("payment") === "card" && result.clientSecret) {
+        if (!result.publishableKey)
+          throw new Error(
+            "Stripe test checkout is not configured; the order is reserved and can be retried safely.",
+          );
+        setPayment(result);
+        setPage("card");
+      } else {
+        setBasket({});
+        setPage("tracking");
+      }
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -138,6 +159,21 @@ export default function Home() {
       setError((e as Error).message);
     }
   }
+  if (page === "card" && payment)
+    return (
+      <main>
+        <ErrorMessage error={error} />
+        <CardPayment
+          payment={payment}
+          onError={setError}
+          onDone={() => {
+            setPayment(null);
+            setBasket({});
+            setPage("tracking");
+          }}
+        />
+      </main>
+    );
   if (page === "login")
     return (
       <>
@@ -259,8 +295,8 @@ export default function Home() {
               </section>
             )}
             <p className="notice">
-              Development ordering only. Cash checkout is available for approved
-              partners. Online card checkout is not yet enabled in this
+              Development ordering only. Cash and Stripe test card checkout
+              require approved partners and configured test payments in this
               interface.
             </p>
           </>
@@ -377,7 +413,18 @@ export default function Home() {
                         <label>
                           Payment method
                           <select name="payment">
-                            <option>Cash · pay the takeaway directly</option>
+                            <option value="cash">
+                              Cash · pay the takeaway directly
+                            </option>
+                            <option
+                              value="card"
+                              disabled={!menu.cardCheckoutAvailable}
+                            >
+                              Card · Stripe test mode
+                              {!menu.cardCheckoutAvailable
+                                ? " (unavailable)"
+                                : ""}
+                            </option>
                           </select>
                         </label>
                         <p className="notice">
@@ -393,7 +440,7 @@ export default function Home() {
                         <button disabled={busy || !items.length}>
                           {busy
                             ? "Placing order…"
-                            : `Place cash order · ${money(total)}`}
+                            : `Place order · ${money(total)}`}
                         </button>
                       </form>
                     </div>
@@ -485,10 +532,39 @@ export default function Home() {
                   <Status value={order.status} />
                   <p>
                     Payment:{" "}
-                    {order.payment_state === "pending"
+                    {order.payment_state === "pending" &&
+                    order.payment_method === "cash"
                       ? "Cash due to the takeaway"
                       : order.payment_state.replaceAll("_", " ")}
                   </p>
+                  {order.status === "awaiting_payment" && (
+                    <button
+                      onClick={async () => {
+                        try {
+                          const result = await api(
+                            `/orders/${order.id}/payment`,
+                            {
+                              method: "POST",
+                              headers: {
+                                "x-order-token":
+                                  localStorage.getItem(
+                                    "north-order-" + order.id,
+                                  ) || "",
+                              },
+                            },
+                          );
+                          if (!result.publishableKey || !result.clientSecret)
+                            throw new Error("Stripe test checkout unavailable");
+                          setPayment(result);
+                          setPage("card");
+                        } catch (e) {
+                          setError((e as Error).message);
+                        }
+                      }}
+                    >
+                      Resume test card payment
+                    </button>
+                  )}
                   {order.items.map((i: any) => (
                     <p key={i.name}>
                       {i.quantity} × {i.name} ·{" "}

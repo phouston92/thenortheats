@@ -1,4 +1,7 @@
 import Fastify from "fastify";
+import { mfaRoutes } from "./mfa";
+import { authAbuseProtection } from "./abuse";
+import { connectRoutes } from "./connect";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
@@ -17,6 +20,8 @@ export async function createApp(
   provider?: PaymentProvider,
 ) {
   const app = Fastify({
+    trustProxy:
+      process.env.TRUST_PROXY_CIDRS?.split(",").map((x) => x.trim()) || false,
     logger:
       process.env.NODE_ENV === "test"
         ? false
@@ -31,10 +36,19 @@ export async function createApp(
     disableRequestLogging: true,
   });
   await app.register(cors, {
-    origin: ["http://localhost:8081", "http://127.0.0.1:8081"],
+    origin:
+      process.env.NODE_ENV === "production"
+        ? false
+        : ["http://localhost:8081", "http://127.0.0.1:8081"],
     credentials: true,
   });
   await app.register(cookie);
+  authAbuseProtection(app, db);
+  app.addHook("onSend", async (req, reply, payload) => {
+    if (req.url.startsWith("/api/"))
+      reply.header("cache-control", "no-store");
+    return payload;
+  });
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   await app.register(helmet);
   await app.register(swagger, {
@@ -73,6 +87,8 @@ export async function createApp(
     return { status: "ready" };
   });
   await authRoutes(app, db);
+  await mfaRoutes(app, db);
+  await connectRoutes(app, db);
   app.get(
     "/api/towns",
     async () => db`SELECT * FROM towns WHERE active ORDER BY name`,
@@ -86,7 +102,7 @@ export async function createApp(
   app.get("/api/partners/:id/menu", async (req, reply) => {
     const p = id.parse((req.params as any).id);
     const [partner] =
-      await db`SELECT id,name,delivery_fee,collection FROM partners WHERE id=${p} AND status='active' AND NOT paused`;
+      await db`SELECT id,name,delivery_fee,collection,(stripe_account IS NOT NULL) AS has_stripe_account FROM partners WHERE id=${p} AND status='active' AND NOT paused`;
     if (!partner)
       return reply.code(404).send({ error: "Takeaway unavailable" });
     const [policy] =
@@ -94,6 +110,12 @@ export async function createApp(
     return {
       partner,
       serviceFee: policy?.service_fee,
+      cardCheckoutAvailable: Boolean(
+        partner.has_stripe_account &&
+        process.env.STRIPE_SECRET_KEY?.startsWith("sk_test_") &&
+        process.env.STRIPE_PUBLISHABLE_KEY?.startsWith("pk_test_") &&
+        process.env.STRIPE_WEBHOOK_SECRET,
+      ),
       products:
         await db`SELECT id,name,category,description,price,allergens,available FROM products WHERE partner_id=${p} ORDER BY category,name`,
     };
@@ -193,6 +215,10 @@ export async function createApp(
   app.get("/api/admin/integrations", async (req) => {
     admin(await actor(db, req));
     return db`SELECT * FROM integrations WHERE enabled`;
+  });
+  app.get("/api/admin/payments/compensations", async (req) => {
+    admin(await actor(db, req));
+    return db`SELECT c.*,o.partner_id,o.payment_state,o.total,o.refunded_amount FROM payment_compensations c JOIN orders o ON o.id=c.order_id WHERE c.state<>'succeeded' ORDER BY c.updated_at LIMIT 200`;
   });
   app.get("/api/admin/summary", async (req) => {
     admin(await actor(db, req));

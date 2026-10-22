@@ -531,6 +531,49 @@ function App() {
         {page === "Settings" && partner && (
           <section className="panel form-panel">
             <div className="panel-body">
+              {user.role === "owner" && (
+                <section>
+                  <h2>Stripe test payments</h2>
+                  <p>
+                    Connect a Standard account. Payments stay disabled until
+                    Stripe confirms readiness and supported fee responsibility.
+                  </p>
+                  <button
+                    onClick={async () => {
+                      try {
+                        const result = await api(
+                          `/partner/${partnerId}/payments/onboarding`,
+                          { method: "POST" },
+                        );
+                        window.location.assign(result.url);
+                      } catch (e) {
+                        setError((e as Error).message);
+                      }
+                    }}
+                  >
+                    Continue Stripe test onboarding
+                  </button>
+                  <button
+                    className="quiet"
+                    onClick={async () => {
+                      try {
+                        const result = await api(
+                          `/partner/${partnerId}/payments/readiness`,
+                        );
+                        setNotice(
+                          result.ready
+                            ? "Stripe test account ready."
+                            : "Stripe test account is not ready for charges.",
+                        );
+                      } catch (e) {
+                        setError((e as Error).message);
+                      }
+                    }}
+                  >
+                    Check payment readiness
+                  </button>
+                </section>
+              )}
               <h2>Ordering preferences</h2>
               <form
                 onSubmit={async (e) => {

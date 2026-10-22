@@ -12,7 +12,7 @@ Run `pnpm dev:api`. `GET /api/docs` returns generated OpenAPI JSON. It enumerate
 - Stripe: `POST /api/webhooks/stripe` verifies the original raw body signature, refuses live events, deduplicates event IDs, validates connected account/currency/amount and cannot downgrade captured/refunded payments on a late failure.
 - Support: list/create tickets; read/add authorised ticket messages.
 
-Only immediate checkout is enabled. Scheduled orders fail explicitly. Card intent creation is API infrastructure only, with test keys required and a ready Standard connected account. There is no working customer card payment UI or account onboarding UI.
+Only immediate checkout is enabled. Scheduled orders fail explicitly. Stripe test card checkout and owner onboarding UI are implemented. They require configured test credentials and a supported Standard account; external provider verification remains blocked.
 
 ## Example cash checkout body
 
@@ -30,3 +30,13 @@ Only immediate checkout is enabled. Scheduled orders fail explicitly. Card inten
 ```
 
 The partner must first have approved pricing and active status. Example is data, not a claim that the seed automatically enables ordering.
+
+## Payment/security follow-up routes
+
+- `GET /api/auth/mfa`: own enrollment status/recovery count (admin only).
+- `POST /api/auth/mfa/rotate`: fresh current TOTP starts a session-bound ten-minute rotation; `/confirm` validates the new TOTP, revokes all sessions and returns recovery codes once. `POST /api/auth/verify` optionally accepts one recoveryCode instead of mfa, alongside email OTP.
+- `POST /api/auth/sessions/revoke`: invalidate other sessions for the current user.
+- Owner/admin `GET /api/partner/:id/payments/readiness`, `POST /api/partner/:id/payments/onboarding`: test-only Standard Connect flow with trusted configured return URLs.
+- `POST /api/orders/:id/payment`: same guest capability or owning customer session/CSRF resumes a card intent; no new order is created. The response includes only a test publishable key, intent client secret and connected-account context; treat the client secret as private.
+- Owner/admin `POST /api/partner/:id/orders/:orderId/capture`: capture an authorised active order using a durable key; returns awaiting_webhook, never claims settlement from HTTP alone.
+- `GET /api/admin/payments/compensations`: outstanding automatic cancellation/refund work and reconciliation blockers. Signed reconciliation/refund settlement resolves corresponding financial state; no endpoint can simply mark provider work successful.

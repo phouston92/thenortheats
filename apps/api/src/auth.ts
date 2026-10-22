@@ -6,7 +6,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
-import { TOTP, Secret } from "otpauth";
+import { verifyMfa, recoveryHash } from "./mfa";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { Database } from "../../../packages/database/src/index";
@@ -116,6 +116,10 @@ export async function authRoutes(app: FastifyInstance, db: Database) {
           challengeId: z.uuid(),
           challenge: z.string().length(32),
           code: z.string().regex(/^\d{6}$/),
+          recoveryCode: z
+            .string()
+            .regex(/^[a-f0-9]{32}$/)
+            .optional(),
           mfa: z
             .string()
             .regex(/^\d{6}$/)
@@ -148,18 +152,13 @@ export async function authRoutes(app: FastifyInstance, db: Database) {
         }
         if (u.disabled) return null;
         if (u.role === "admin") {
-          if (!process.env.ADMIN_MFA_SECRET || !input.mfa) return null;
-          const totp = new TOTP({
-            secret: Secret.fromBase32(process.env.ADMIN_MFA_SECRET),
-            period: 30,
-            digits: 6,
-          });
-          const delta = totp.validate({ token: input.mfa, window: 1 });
-          if (delta === null) return null;
-          const counter = Math.floor(Date.now() / 30000) + delta;
-          const used =
-            await tx`INSERT INTO mfa_uses(user_id,counter) VALUES(${u.id},${counter}) ON CONFLICT DO NOTHING RETURNING counter`;
-          if (!used.length) return null;
+          if (input.recoveryCode) {
+            const used =
+              await tx`DELETE FROM mfa_recovery_codes WHERE user_id=${u.id} AND code_hash=${recoveryHash(u.id, input.recoveryCode)} RETURNING code_hash`;
+            if (!used.length) return null;
+            await tx`DELETE FROM sessions WHERE user_id=${u.id}`;
+            await tx`INSERT INTO audit_logs(actor_id,action,subject) VALUES(${u.id},'auth.mfa.recovery',${u.id})`;
+          } else if (!(await verifyMfa(tx, u.id, input.mfa))) return null;
         }
         await tx`UPDATE auth_challenges SET consumed=true WHERE id=${c.id}`;
         const token = randomBytes(32).toString("hex");
@@ -178,7 +177,9 @@ export async function authRoutes(app: FastifyInstance, db: Database) {
           .send({ error: "Invalid or expired verification" });
       reply.setCookie("north_session", result.token, {
         httpOnly: true,
-        secure: process.env.COOKIE_SECURE === "true",
+        secure:
+          process.env.NODE_ENV === "production" ||
+          process.env.COOKIE_SECURE === "true",
         sameSite: "strict",
         path: "/",
         maxAge: 43200,

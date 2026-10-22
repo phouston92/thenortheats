@@ -12,6 +12,11 @@ export interface PaymentProvider {
     key: string,
     refundServiceFee: boolean,
   ): Promise<{ id: string; status: string }>;
+  cancel?(
+    intent: string,
+    account: string,
+    key: string,
+  ): Promise<"cancelled" | "captured">;
   capture(intent: string, account: string, key: string): Promise<void>;
 }
 export class StripeProvider implements PaymentProvider {
@@ -52,12 +57,13 @@ export class StripeProvider implements PaymentProvider {
             amount: order.total,
             currency: "gbp",
             application_fee_amount: order.service_fee,
-            automatic_payment_methods: { enabled: true },
+            payment_method_types: ["card"],
             metadata: { orderId: order.id },
           },
           { stripeAccount: account, idempotencyKey: "order:" + order.id },
         );
     if (
+      p.livemode ||
       p.amount !== order.total ||
       p.currency !== "gbp" ||
       (p.application_fee_amount ?? 0) !== order.service_fee ||
@@ -65,6 +71,25 @@ export class StripeProvider implements PaymentProvider {
     )
       throw new Error("Payment intent reconciliation mismatch");
     return { id: p.id, clientSecret: p.client_secret };
+  }
+  async cancel(
+    intent: string,
+    account: string,
+    key: string,
+  ): Promise<"cancelled" | "captured"> {
+    const p = await this.stripe.paymentIntents.retrieve(
+      intent,
+      {},
+      { stripeAccount: account },
+    );
+    if (p.status === "succeeded") return "captured";
+    if (p.status !== "canceled")
+      await this.stripe.paymentIntents.cancel(
+        intent,
+        {},
+        { stripeAccount: account, idempotencyKey: key },
+      );
+    return "cancelled";
   }
   async capture(intent: string, account: string, key: string) {
     await this.stripe.paymentIntents.capture(
@@ -91,8 +116,20 @@ export class StripeProvider implements PaymentProvider {
     );
     return { id: r.id, status: r.status || "pending" };
   }
+  async createAccount(partnerId: string) {
+    return this.stripe.accounts.create(
+      { type: "standard", country: "GB", metadata: { partnerId } },
+      { idempotencyKey: "connect:" + partnerId },
+    );
+  }
   async onboarding(account: string, refreshUrl: string, returnUrl: string) {
-    await this.ready(account);
+    const a = await this.stripe.accounts.retrieve(account);
+    if (
+      a.type !== "standard" ||
+      a.controller?.fees?.payer !== "account" ||
+      a.controller?.losses?.payments !== "stripe"
+    )
+      throw new Error("Unsupported connected account configuration");
     return this.stripe.accountLinks.create({
       account,
       refresh_url: refreshUrl,

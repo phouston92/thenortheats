@@ -44,7 +44,7 @@ describe("Stripe test-only direct charge allocation", () => {
         amount: 1250,
         currency: "gbp",
         application_fee_amount: 100,
-        automatic_payment_methods: { enabled: true },
+        payment_method_types: ["card"],
         metadata: { orderId: "order_fixture" },
       },
       { stripeAccount: account.id, idempotencyKey: "order:order_fixture" },
@@ -203,6 +203,7 @@ describe("Stripe test-only direct charge allocation", () => {
     expect(create).not.toHaveBeenCalled();
   });
   it.each<Partial<Stripe.PaymentIntent>>([
+    { livemode: true },
     { amount: 1051 },
     { currency: "usd" },
     { application_fee_amount: 99 },
@@ -224,4 +225,55 @@ describe("Stripe test-only direct charge allocation", () => {
       ).rejects.toThrow("reconciliation mismatch");
     },
   );
+  it("allows an unready supported Standard account to enter onboarding", async () => {
+    const p = new StripeProvider("sk_test_fixture");
+    vi.spyOn(p.stripe.accounts, "retrieve").mockResolvedValue({
+      ...response,
+      charges_enabled: false,
+      payouts_enabled: false,
+    });
+    const stop = new Error("no network");
+    const links = vi
+      .spyOn(p.stripe.accountLinks, "create")
+      .mockRejectedValue(stop);
+    await expect(
+      p.onboarding(
+        account.id,
+        "https://portal.test/refresh",
+        "https://portal.test/return",
+      ),
+    ).rejects.toBe(stop);
+    expect(links).toHaveBeenCalledWith({
+      account: account.id,
+      refresh_url: "https://portal.test/refresh",
+      return_url: "https://portal.test/return",
+      type: "account_onboarding",
+    });
+  });
+  it("does not cancel a payment that captured while cancellation was in flight", async () => {
+    const p = new StripeProvider("sk_test_fixture");
+    vi.spyOn(p.stripe.paymentIntents, "retrieve").mockResolvedValue(
+      intentResponse({ status: "succeeded" }),
+    );
+    const cancel = vi.spyOn(p.stripe.paymentIntents, "cancel");
+    await expect(
+      p.cancel("pi_existing", account.id, "cancel_fixture"),
+    ).resolves.toBe("captured");
+    expect(cancel).not.toHaveBeenCalled();
+  });
+  it("propagates failed captures with their stable account and operation key", async () => {
+    const p = new StripeProvider("sk_test_fixture"),
+      stop = new Error("declined");
+    const capture = vi
+      .spyOn(p.stripe.paymentIntents, "capture")
+      .mockRejectedValue(stop);
+    await expect(
+      p.capture("pi_existing", account.id, "capture_fixture"),
+    ).rejects.toBe(stop);
+    expect(capture).toHaveBeenCalledWith(
+      "pi_existing",
+      {},
+      { stripeAccount: account.id, idempotencyKey: "capture_fixture" },
+    );
+  });
 });

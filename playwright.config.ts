@@ -13,7 +13,7 @@ const env = {
   API_ORIGIN: "http://127.0.0.1:3101",
   EXPO_PUBLIC_API_URL: "http://localhost:3101",
   NEXT_DIST_DIR: ".next-browser",
-  ADMIN_MFA_SECRET: "JBSWY3DPEHPK3PXP",
+  MFA_ENCRYPTION_KEY: "42".repeat(32),
   DEV_MAIL_DIR: "/tmp/north-browser-mail",
 };
 export default defineConfig({

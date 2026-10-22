@@ -1,5 +1,7 @@
 # Development progress — 22 October 2026
 
+**Latest follow-up:** [Payment, security and deployment isolation review](payment-security-review.md) supersedes historical result counts and earlier unfinished MFA/onboarding/container statements below. No external provider verification or deployment is claimed.
+
 Branch: `feature/platform-development-baseline`, based on `main`. No production deployment, live payment or VPS connection. The result is an integrated development baseline; Phases 2–4 are partial. The full brief is **not complete**. See requirements-coverage.md for every major unfinished area.
 
 ## Phase 1 — foundations checkpoint

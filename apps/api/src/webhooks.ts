@@ -102,6 +102,11 @@ export async function webhookRoutes(app: FastifyInstance, db: Database) {
           await tx`INSERT INTO order_history(order_id,status) VALUES(${p.order_id},'awaiting_acceptance')`;
           await tx`INSERT INTO notifications(order_id,recipient,kind) SELECT id,partner_id::text,'new_order' FROM orders WHERE id=${p.order_id} ON CONFLICT DO NOTHING`;
         }
+        if (
+          state === "captured" &&
+          ["cancelled", "rejected"].includes(p.order_status)
+        )
+          await tx`INSERT INTO payment_compensations(order_id) VALUES(${p.order_id}) ON CONFLICT(order_id) DO UPDATE SET state='pending',updated_at=now() WHERE payment_compensations.state='succeeded'`;
         await tx`INSERT INTO reconciliation_records(provider_id,order_id,amount,state) VALUES(${event.id},${p.order_id},${p.amount},${state}) ON CONFLICT DO NOTHING`;
         return { received: true };
       });

@@ -60,6 +60,45 @@ export async function orderRoutes(
   providerOverride?: PaymentProvider,
 ) {
   const provider = () => providerOverride || new StripeProvider();
+  async function resumePayment(orderId: string) {
+    const [o] = await db<
+      {
+        id: string;
+        total: number;
+        service_fee: number;
+        stripe_account: string;
+        provider_id: string | null;
+        updated_at: Date;
+        status: string;
+      }[]
+    >`SELECT o.*,p.stripe_account,p.provider_id,p.updated_at FROM orders o JOIN payments p ON p.order_id=o.id WHERE o.id=${orderId}`;
+    if (o.status !== "awaiting_payment") return { id: o.id };
+    // Stripe may prune idempotency keys after 24 hours. Retrieve known intents,
+    // and fail closed for old interrupted creation instead of risking a second charge.
+    if (
+      !o.provider_id &&
+      Date.now() - new Date(o.updated_at).getTime() >= 23 * 60 * 60 * 1000
+    )
+      throw fail(
+        "Interrupted payment requires provider reconciliation before retry",
+      );
+    const intent = await provider().intent(
+      o,
+      o.stripe_account,
+      o.provider_id ?? undefined,
+    );
+    const bound =
+      await db`UPDATE payments SET provider_id=${intent.id} WHERE order_id=${o.id} AND (provider_id IS NULL OR provider_id=${intent.id}) RETURNING id`;
+    if (!bound.length) throw fail("Payment provider identity mismatch");
+    return {
+      id: o.id,
+      clientSecret: intent.clientSecret,
+      stripeAccount: o.stripe_account,
+      publishableKey: process.env.STRIPE_PUBLISHABLE_KEY?.startsWith("pk_test_")
+        ? process.env.STRIPE_PUBLISHABLE_KEY
+        : null,
+    };
+  }
   app.post("/api/orders", async (req, reply) => {
     const v = checkoutInput.parse(req.body);
     const requestKey = z.uuid().parse(req.headers["idempotency-key"]);
@@ -165,46 +204,29 @@ export async function orderRoutes(
     });
     // Provider call occurs outside the SQL transaction, recoverable via the same order idempotency key.
     if (result.payment_method === "card") {
-      const [o] = await db<
-        {
-          id: string;
-          total: number;
-          service_fee: number;
-          stripe_account: string;
-          provider_id: string | null;
-          updated_at: Date;
-          status: string;
-        }[]
-      >`SELECT o.*,p.stripe_account,p.provider_id,p.updated_at FROM orders o JOIN payments p ON p.order_id=o.id WHERE o.id=${result.id}`;
-      if (o.status !== "awaiting_payment")
-        return reply.code(201).send({ id: o.id });
-      // Stripe may prune idempotency keys after 24 hours. Retrieve known intents,
-      // and fail closed for old interrupted creation instead of risking a second charge.
-      if (
-        !o.provider_id &&
-        Date.now() - new Date(o.updated_at).getTime() >= 23 * 60 * 60 * 1000
-      )
-        throw fail(
-          "Interrupted payment requires provider reconciliation before retry",
-        );
-      const intent = await provider().intent(
-        o,
-        o.stripe_account,
-        o.provider_id ?? undefined,
-      );
-      const bound =
-        await db`UPDATE payments SET provider_id=${intent.id} WHERE order_id=${o.id} AND (provider_id IS NULL OR provider_id=${intent.id}) RETURNING id`;
-      if (!bound.length) throw fail("Payment provider identity mismatch");
-      return reply
-        .code(201)
-        .send({ id: o.id, clientSecret: intent.clientSecret });
+      return reply.code(201).send(await resumePayment(result.id));
     }
     return reply.code(201).send({ id: result.id });
+  });
+  app.post("/api/orders/:id/payment", async (req, reply) => {
+    const orderId = id.parse((req.params as any).id);
+    const [o] =
+      await db`SELECT id,tracking_hash,customer_id,payment_method FROM orders WHERE id=${orderId}`;
+    if (!o) return reply.code(404).send({ error: "Order not found" });
+    const token = req.headers["x-order-token"];
+    let allowed = typeof token === "string" && hash(token) === o.tracking_hash;
+    if (req.cookies.north_session) {
+      const a = await actor(db, req);
+      allowed = allowed || (a.role === "customer" && o.customer_id === a.id);
+    }
+    if (!allowed) return reply.code(404).send({ error: "Order not found" });
+    if (o.payment_method !== "card") throw fail("Card order required");
+    return resumePayment(orderId);
   });
   app.get("/api/orders/:id", async (req, reply) => {
     const orderId = id.parse((req.params as any).id);
     const [o] =
-      await db`SELECT id,partner_id,customer_id,tracking_hash,customer_name,customer_email,address,status,payment_state,fulfilment,subtotal,delivery_fee,service_fee,total,created_at,refunded_amount FROM orders WHERE id=${orderId}`;
+      await db`SELECT id,partner_id,customer_id,tracking_hash,customer_name,customer_email,address,status,payment_state,payment_method,fulfilment,subtotal,delivery_fee,service_fee,total,created_at,refunded_amount FROM orders WHERE id=${orderId}`;
     if (!o) return reply.code(404).send({ error: "Order not found" });
     const token = req.headers["x-order-token"];
     let allowed = typeof token === "string" && hash(token) === o.tracking_hash;
@@ -276,11 +298,50 @@ export async function orderRoutes(
         throw fail("Captured payment required");
       await tx`UPDATE orders SET status=${v.status},completed_at=CASE WHEN ${v.status}='completed' THEN now() ELSE completed_at END,payment_state=CASE WHEN ${v.status}='completed' AND payment_method='cash' THEN 'captured' ELSE payment_state END WHERE id=${o.id}`;
       await tx`INSERT INTO order_history(order_id,status,reason,actor_id) VALUES(${o.id},${v.status},${v.reason || null},${a.id})`;
+      if (
+        ["cancelled", "rejected"].includes(v.status) &&
+        o.payment_method === "card"
+      )
+        await tx`INSERT INTO payment_compensations(order_id) VALUES(${o.id}) ON CONFLICT DO NOTHING`;
       if (v.status === "completed") await completeFees(tx, o);
       await tx`INSERT INTO notifications(order_id,recipient,kind,payload) VALUES(${o.id},${o.customer_email},${"status:" + v.status},${tx.json({ status: v.status })}) ON CONFLICT DO NOTHING`;
       await audit(tx, a, "order." + v.status, o.id, p);
       return { id: o.id, status: v.status };
     });
+  });
+  app.post("/api/partner/:id/orders/:orderId/capture", async (req) => {
+    const a = await actor(db, req),
+      p = id.parse((req.params as any).id);
+    tenant(a, p, true);
+    const orderId = id.parse((req.params as any).orderId);
+    const operation = await db.begin(async (tx) => {
+      const [o] =
+        await tx`SELECT o.*,p.provider_id,p.stripe_account FROM orders o JOIN payments p ON p.order_id=o.id WHERE o.id=${orderId} AND o.partner_id=${p} FOR UPDATE OF o,p`;
+      if (!o) throw fail("Order not found", 404);
+      if (o.payment_state === "captured") return null;
+      if (
+        o.payment_state !== "authorised" ||
+        ["cancelled", "rejected"].includes(o.status)
+      )
+        throw fail("Authorised active payment required");
+      const [op] =
+        await tx`INSERT INTO capture_operations(order_id) VALUES(${o.id}) ON CONFLICT(order_id) DO UPDATE SET order_id=EXCLUDED.order_id RETURNING *`;
+      if (Date.now() - new Date(op.created_at).getTime() >= 23 * 60 * 60 * 1000)
+        throw fail("Interrupted capture requires reconciliation");
+      return {
+        provider_id: String(o.provider_id),
+        stripe_account: String(o.stripe_account),
+        key: String(op.request_key),
+      };
+    });
+    if (operation)
+      await provider().capture(
+        operation.provider_id,
+        operation.stripe_account,
+        operation.key,
+      );
+    // Only a verified webhook can report captured or advance fulfilment.
+    return { status: operation ? "awaiting_webhook" : "captured" };
   });
   app.get("/api/partner/:id/finance", async (req) => {
     const p = id.parse((req.params as any).id);
@@ -477,6 +538,8 @@ export async function settleRefundInTransaction(
   await tx`UPDATE refunds SET status='succeeded',provider_id=${providerId} WHERE id=${r.id}`;
   await tx`UPDATE orders SET refunded_amount=${cumulative},payment_state=${paymentState} WHERE id=${o.id}`;
   await tx`UPDATE payments SET state=${paymentState},updated_at=now() WHERE order_id=${o.id}`;
+  if (cumulative === o.total)
+    await tx`UPDATE payment_compensations SET state='succeeded',last_error=NULL,updated_at=now() WHERE order_id=${o.id}`;
   await tx`INSERT INTO audit_logs(actor_id,partner_id,action,subject) VALUES(${actorId},${o.partner_id},'refund.settled',${r.id})`;
   return { id: r.id, status: "succeeded", amount: r.amount };
 }

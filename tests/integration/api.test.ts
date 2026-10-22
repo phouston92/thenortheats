@@ -1,3 +1,5 @@
+import { validateRuntimeDatabase } from "../../packages/database/src/runtime-security";
+import { compensateOrder } from "../../apps/api/src/compensation";
 import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -9,6 +11,8 @@ import Stripe from "stripe";
 import { TOTP, Secret } from "otpauth";
 import type { PaymentProvider } from "../../packages/payments/src/index";
 import { weekStart } from "../../packages/shared/src/index";
+import { encryptMfa } from "../../apps/api/src/mfa";
+process.env.MFA_ENCRYPTION_KEY = "42".repeat(32);
 import { hash } from "../../apps/api/src/auth";
 const url = process.env.TEST_DATABASE_URL;
 if (!url || !new URL(url).pathname.endsWith("_test"))
@@ -29,10 +33,13 @@ const intentProvider = vi
     id: "pi_" + o.id,
     clientSecret: "test_fixture_only",
   }));
+const captureProvider = vi
+  .fn<PaymentProvider["capture"]>()
+  .mockResolvedValue(undefined);
 const app = await createApp(db, {
   intent: intentProvider,
   refund: refundProvider,
-  capture: async () => {},
+  capture: captureProvider,
 });
 const p1 = "10000000-0000-4000-8000-000000000001",
   p2 = "10000000-0000-4000-8000-000000000002";
@@ -50,7 +57,7 @@ async function session(role: string, email: string, p?: string) {
 beforeAll(async () => {
   await migrate(db);
   await migrate(db);
-  await db`TRUNCATE towns,users,webhook_events CASCADE`;
+  await db`TRUNCATE towns,users,webhook_events,auth_rate_limits CASCADE`;
   await seed(db);
   await seed(db);
   admin = await session("admin", "admin@test.local");
@@ -966,9 +973,11 @@ describe("phase 3 order and billing scenarios", () => {
     }
   });
   it("administrator OTP requires MFA and a TOTP counter cannot be replayed", async () => {
-    process.env.ADMIN_MFA_SECRET = "JBSWY3DPEHPK3PXP";
+    const mfaSecret = "JBSWY3DPEHPK3PXP";
     const email = "mfa-regression@test.local";
     await session("admin", email);
+    const [mfaUser] = await db`SELECT id FROM users WHERE email=${email}`;
+    await db`INSERT INTO admin_mfa(user_id,secret_ciphertext) VALUES(${mfaUser.id},${encryptMfa(mfaSecret, mfaUser.id)})`;
     const secret = "c".repeat(32),
       code = "123456";
     async function challenge() {
@@ -989,7 +998,7 @@ describe("phase 3 order and billing scenarios", () => {
       ).statusCode,
     ).toBe(401);
     const mfa = new TOTP({
-      secret: Secret.fromBase32(process.env.ADMIN_MFA_SECRET),
+      secret: Secret.fromBase32(mfaSecret),
     }).generate();
     expect(
       (
@@ -1121,6 +1130,302 @@ describe("phase 3 order and billing scenarios", () => {
       expect(sum).toMatchObject({ net: 0, vat: 0, count: 8 });
     } finally {
       vi.useRealTimers();
+    }
+  });
+  it("enforces authentication account limits across API instances and source IPs", async () => {
+    const other = await createApp(db);
+    await other.ready();
+    try {
+      const email = "distributed-limit@test.local";
+      for (let i = 0; i < 5; i++)
+        expect(
+          (
+            await (i % 2 ? other : app).inject({
+              method: "POST",
+              url: "/api/auth/request",
+              remoteAddress: "127.8.0." + (i + 1),
+              payload: { email },
+            })
+          ).statusCode,
+        ).toBe(202);
+      expect(
+        (
+          await other.inject({
+            method: "POST",
+            url: "/api/auth/request",
+            remoteAddress: "127.8.1.99",
+            payload: { email: email.toUpperCase() },
+          })
+        ).statusCode,
+      ).toBe(429);
+    } finally {
+      await other.close();
+    }
+  });
+  it("requires owner access for onboarding and does not leak cross-tenant readiness", async () => {
+    expect(
+      (
+        await app.inject({
+          url: `/api/partner/${p2}/payments/readiness`,
+          headers: owner,
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/partner/${p1}/payments/onboarding`,
+          headers: operator,
+        })
+      ).statusCode,
+    ).toBe(403);
+  });
+  it("resumes a bound card intent using its capability without creating another order", async () => {
+    const res = await checkout("card"),
+      orderId = res.json().id;
+    expect(res.statusCode).toBe(201);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/orders/${orderId}/payment`,
+        })
+      ).statusCode,
+    ).toBe(404);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/orders/${orderId}/payment`,
+          headers: { "x-order-token": tracking },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(intentProvider.mock.calls.at(-1)?.[2]).toBe("pi_" + orderId);
+    expect(
+      (
+        await db`SELECT count(*)::int AS count FROM payments WHERE order_id=${orderId}`
+      )[0].count,
+    ).toBe(1);
+  });
+  it("failed captures leave fulfilment unchanged and retry the same provider operation", async () => {
+    const res = await checkout("card"),
+      order = res.json().id;
+    await webhook(order, "payment_intent.amount_capturable_updated");
+    const request = {
+      method: "POST" as const,
+      url: `/api/partner/${p1}/orders/${order}/capture`,
+      headers: owner,
+    };
+    captureProvider.mockRejectedValueOnce(new Error("network interrupted"));
+    expect((await app.inject(request)).statusCode).toBe(500);
+    expect((await transition(order, "accepted")).statusCode).toBe(409);
+    expect((await app.inject(request)).json().status).toBe("awaiting_webhook");
+    const calls = captureProvider.mock.calls.slice(-2);
+    expect(calls[0]).toEqual(calls[1]);
+    expect(
+      (await db`SELECT payment_state,status FROM orders WHERE id=${order}`)[0],
+    ).toMatchObject({
+      payment_state: "authorised",
+      status: "awaiting_payment",
+    });
+    await webhook(order, "payment_intent.succeeded");
+    expect((await transition(order, "accepted")).statusCode).toBe(200);
+  });
+  it("refunds rejected captured orders once after an interrupted provider response", async () => {
+    const order = await capturedCard(false);
+    expect(
+      (await transition(order, "rejected", "Kitchen unavailable")).statusCode,
+    ).toBe(200);
+    const refund = vi
+      .fn<PaymentProvider["refund"]>()
+      .mockRejectedValueOnce(new Error("lost response"))
+      .mockImplementation(async (_i, _a, _amount, key) => ({
+        id: "re_" + key,
+        status: "succeeded",
+      }));
+    const p = { intent: intentProvider, capture: captureProvider, refund };
+    await compensateOrder(db, p, order);
+    expect(
+      (
+        await db`SELECT state FROM payment_compensations WHERE order_id=${order}`
+      )[0].state,
+    ).toBe("pending");
+    await Promise.all([
+      compensateOrder(db, p, order),
+      compensateOrder(db, p, order),
+    ]);
+    await compensateOrder(db, p, order);
+    const [o] =
+      await db`SELECT total,refunded_amount,payment_state FROM orders WHERE id=${order}`;
+    expect(o.refunded_amount).toBe(o.total);
+    expect(o.payment_state).toBe("refunded");
+    expect(
+      (await db`SELECT * FROM refunds WHERE order_id=${order}`).length,
+    ).toBe(1);
+    expect(new Set(refund.mock.calls.map((c) => c[3])).size).toBe(1);
+    expect(refund.mock.calls.every((c) => c[4] === true)).toBe(true);
+    expect(
+      (await db`SELECT * FROM ledger_entries WHERE order_id=${order}`).length,
+    ).toBe(0);
+  });
+  it("retains a failed cancellation refund as a visible blocker without inventing credits", async () => {
+    const order = await capturedCard(false);
+    await transition(order, "cancelled", "Customer cancellation");
+    const refund = vi
+      .fn<PaymentProvider["refund"]>()
+      .mockResolvedValue({ id: "re_failed_" + order, status: "failed" });
+    const p = { intent: intentProvider, capture: captureProvider, refund };
+    await compensateOrder(db, p, order);
+    await compensateOrder(db, p, order);
+    expect(refund).toHaveBeenCalledTimes(1);
+    expect(
+      (
+        await db`SELECT state,last_error FROM payment_compensations WHERE order_id=${order}`
+      )[0],
+    ).toMatchObject({
+      state: "blocked",
+      last_error: "refund_failed_requires_reconciliation",
+    });
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(0);
+  });
+  it("reopens compensation when a signed capture races a confirmed cancellation", async () => {
+    const res = await checkout("card"),
+      order = res.json().id;
+    await transition(order, "cancelled", "No longer required");
+    const cancel = vi
+      .fn<NonNullable<PaymentProvider["cancel"]>>()
+      .mockResolvedValue("cancelled");
+    const p = {
+      intent: intentProvider,
+      capture: captureProvider,
+      refund: refundProvider,
+      cancel,
+    };
+    await compensateOrder(db, p, order);
+    expect(
+      (
+        await db`SELECT state FROM payment_compensations WHERE order_id=${order}`
+      )[0].state,
+    ).toBe("succeeded");
+    expect((await webhook(order, "payment_intent.succeeded")).statusCode).toBe(
+      200,
+    );
+    expect(
+      (
+        await db`SELECT state FROM payment_compensations WHERE order_id=${order}`
+      )[0].state,
+    ).toBe("pending");
+    await compensateOrder(db, p, order);
+    expect(
+      (await db`SELECT payment_state,status FROM orders WHERE id=${order}`)[0],
+    ).toMatchObject({ payment_state: "refunded", status: "cancelled" });
+  });
+  it("rotates only the signed-in administrator MFA, revokes sessions and uses recovery once", async () => {
+    const email = "rotation-admin@test.local",
+      headers = await session("admin", email);
+    const [u] = await db`SELECT id FROM users WHERE email=${email}`;
+    const oldSecret = "JBSWY3DPEHPK3PXP";
+    await db`INSERT INTO admin_mfa(user_id,secret_ciphertext) VALUES(${u.id},${encryptMfa(oldSecret, u.id)})`;
+    const start = await app.inject({
+      method: "POST",
+      url: "/api/auth/mfa/rotate",
+      remoteAddress: "127.9.1.1",
+      headers,
+      payload: {
+        mfa: new TOTP({ secret: Secret.fromBase32(oldSecret) }).generate(),
+      },
+    });
+    expect(start.statusCode).toBe(200);
+    expect(start.headers["cache-control"]).toBe("no-store");
+    const newSecret = start.json().secret;
+    expect(
+      (
+        await db`SELECT secret_ciphertext FROM admin_mfa WHERE user_id=${u.id}`
+      )[0].secret_ciphertext,
+    ).not.toContain(newSecret);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/mfa/confirm",
+          remoteAddress: "127.9.1.2",
+          headers,
+          payload: { mfa: "000000" },
+        })
+      ).statusCode,
+    ).toBe(401);
+    const confirm = await app.inject({
+      method: "POST",
+      url: "/api/auth/mfa/confirm",
+      remoteAddress: "127.9.1.3",
+      headers,
+      payload: {
+        mfa: new TOTP({ secret: Secret.fromBase32(newSecret) }).generate(),
+      },
+    });
+    expect(confirm.statusCode).toBe(200);
+    expect(confirm.json().recoveryCodes).toHaveLength(10);
+    expect(
+      (await app.inject({ url: "/api/auth/me", headers })).statusCode,
+    ).toBe(401);
+    const recoveryCode = confirm.json().recoveryCodes[0];
+    async function recover(ip: string) {
+      const challenge = "d".repeat(32),
+        code = "123456";
+      const [c] =
+        await db`INSERT INTO auth_challenges(email,code_hash,expires_at) VALUES(${email},${hash(challenge + code)},now()+interval '5 minutes') RETURNING id`;
+      return app.inject({
+        method: "POST",
+        url: "/api/auth/verify",
+        remoteAddress: ip,
+        payload: { challengeId: c.id, challenge, code, recoveryCode },
+      });
+    }
+    expect((await recover("127.9.2.1")).statusCode).toBe(200);
+    expect((await recover("127.9.2.2")).statusCode).toBe(401);
+    expect(
+      (
+        await db`SELECT count(*)::int AS count FROM mfa_recovery_codes WHERE user_id=${u.id}`
+      )[0].count,
+    ).toBe(9);
+  });
+  it("runtime database role can read data but cannot mutate immutable records or schema", async () => {
+    await db.unsafe(
+      await readFile(
+        new URL(
+          "../../infrastructure/database/runtime-role.sql",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    );
+    await expect(validateRuntimeDatabase(db)).rejects.toThrow(
+      "least-privilege",
+    );
+    const rows = await db.begin(async (tx) => {
+      await tx.unsafe("SET LOCAL ROLE north_runtime");
+      await validateRuntimeDatabase(tx);
+      return tx`SELECT id FROM towns LIMIT 1`;
+    });
+    expect(rows.length).toBe(1);
+    for (const statement of [
+      "UPDATE ledger_entries SET amount=0",
+      "DELETE FROM audit_logs",
+      "TRUNCATE orders CASCADE",
+      "CREATE TABLE runtime_escape(id int)",
+      "SELECT * FROM schema_migrations",
+    ]) {
+      await expect(
+        db.begin(async (tx) => {
+          await tx.unsafe("SET LOCAL ROLE north_runtime");
+          await tx.unsafe(statement);
+        }),
+      ).rejects.toMatchObject({ code: "42501" });
     }
   });
 });

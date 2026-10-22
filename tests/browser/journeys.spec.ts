@@ -3,6 +3,8 @@ import AxeBuilder from "@axe-core/playwright";
 import { readFile } from "node:fs/promises";
 import { TOTP, Secret } from "otpauth";
 import { connect } from "../../packages/database/src/index";
+import { encryptMfa } from "../../apps/api/src/mfa";
+process.env.MFA_ENCRYPTION_KEY = "42".repeat(32);
 import { migrate } from "../../packages/database/src/migrate";
 const db = connect(process.env.TEST_DATABASE_URL);
 const partnerId = "20000000-0000-4000-8000-000000000001";
@@ -23,6 +25,7 @@ test.beforeAll(async () => {
     await tx`INSERT INTO products(id,partner_id,name,category,price,allergens) VALUES('20000000-0000-4000-8000-000000000003',${partnerId},'Test Margherita','Pizza',950,ARRAY['milk','wheat']) ON CONFLICT(id) DO UPDATE SET available=true`;
     const [owner] =
       await tx`INSERT INTO users(email,role) VALUES('browser-owner@example.test','owner') ON CONFLICT(email) DO UPDATE SET role='owner' RETURNING id`;
+    await tx`INSERT INTO admin_mfa(user_id,secret_ciphertext) VALUES(${admin.id},${encryptMfa("JBSWY3DPEHPK3PXP", admin.id)}) ON CONFLICT(user_id) DO UPDATE SET secret_ciphertext=EXCLUDED.secret_ciphertext`;
     await tx`DELETE FROM mfa_uses WHERE user_id=${admin.id}`;
     await tx`INSERT INTO memberships VALUES(${owner.id},${partnerId}) ON CONFLICT DO NOTHING`;
   });
@@ -110,6 +113,9 @@ test("customer cash checkout → partner completion → customer tracking uses r
     page.getByText("Customer service fee", { exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Review checkout" }).click();
+  await expect(
+    page.getByRole("option", { name: "Card · Stripe test mode (unavailable)" }),
+  ).toHaveJSProperty("disabled", true);
   await page.getByLabel("Full name").fill("Browser Customer");
   await page
     .getByLabel("Email address", { exact: true })
@@ -118,7 +124,7 @@ test("customer cash checkout → partner completion → customer tracking uses r
   const response = page.waitForResponse(
     (r) => r.url().endsWith("/api/orders") && r.request().method() === "POST",
   );
-  await page.getByRole("button", { name: "Place cash order" }).click();
+  await page.getByRole("button", { name: "Place order" }).click();
   const created = await (await response).json();
   await expect(
     page.getByRole("heading", { name: "We’ve got your order." }),

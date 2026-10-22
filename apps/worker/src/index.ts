@@ -1,13 +1,20 @@
+import { validateRuntimeDatabase } from "../../../packages/database/src/runtime-security";
+import { processCompensations } from "../../api/src/compensation";
+import { StripeProvider } from "../../../packages/payments/src/index";
 import { Worker, Queue } from "bullmq";
 import { connect } from "../../../packages/database/src/index";
 import { config } from "../../../packages/config/src/index";
 const env = config();
 const db = connect();
+if (process.env.NODE_ENV === "production") await validateRuntimeDatabase(db);
 const connection = { url: env.REDIS_URL };
 const queue = new Queue("north-outbox", { connection });
 const worker = new Worker(
   "north-outbox",
   async () => {
+    if (process.env.STRIPE_SECRET_KEY)
+      await processCompensations(db, new StripeProvider());
+    await db`DELETE FROM auth_rate_limits WHERE expires_at<now()-interval '1 day'`;
     // Concurrent-safe transactional outbox. No notification is marked sent without provider acknowledgement.
     await db.begin(async (tx) => {
       const messages =

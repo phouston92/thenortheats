@@ -5,3 +5,6 @@ onlyBuiltDependencies:
   - esbuild
   - sharp
   - msgpackr-extract
+
+# Generate a pruned deployment lockfile for an auditable backend runtime.
+injectWorkspacePackages: true
