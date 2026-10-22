@@ -51,7 +51,7 @@ Branch: `feature/platform-development-baseline`, based on `main`. No production 
 | Non-root image runtime                                 | Passed `/api/ready` and database-backed `/api/towns` (four towns); smoke container stopped/removed      |
 | `pnpm dev` convenience startup                         | Started API, worker and three web apps; readiness and HTTP responses checked                            |
 | Dependency audit                                       | **Failed**: 0 critical, 2 high, 2 moderate, 1 low; details in security.md                               |
-| GitHub Actions                                         | Configuration written; hosted run not observed; audit gate is expected to fail                          |
+| GitHub Actions                                         | Workflow triggered and queued/running on GitHub; completed result pending; audit gate is expected to fail                          |
 | External providers/native devices/HA restore           | Unrun or unverified; no readiness claim                                                                 |
 
 Docker initially lacked proxy DNS, then its non-root runtime could not read private-mode copied files. Supported proxy/CA build options and explicit node ownership resolved those failures. The temporary smoke container did not publish any external site.
@@ -60,4 +60,4 @@ Docker initially lacked proxy DNS, then its non-root runtime could not read priv
 
 Reusable `install_script` and `start_skill` saved to the cloud environment draft. Required network destinations for browser downloads, Stripe documentation and GitHub API were added while preserving package-manager presets. Draft saving does not publish the snapshot or prove restoration into a fresh task. Review/save environment settings and publish only the **development** environment when appropriate; this is unrelated to production deployment.
 
-Git HTTPS read and dry-run feature-branch push worked through the platform proxy. GitHub API read was blocked (`Forbidden`); no token values were requested or disclosed. The final branch push and draft-PR outcome are recorded in the task's delivery response and completion-report.md. No merge is authorised.
+Git HTTPS read and feature-branch push succeeded through the platform proxy. GitHub API access initially returned `Forbidden`, but the subsequent authorised draft-PR creation succeeded. Draft PR [#1](https://github.com/phouston92/thenortheats/pull/1) is open, targets `main`, and was verified as a draft. GitHub Actions was queued/running at the final observation; no completed hosted result is claimed. No token values were requested/disclosed and no merge occurred.

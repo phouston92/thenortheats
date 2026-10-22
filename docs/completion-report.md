@@ -13,7 +13,7 @@ The North Eats now has a working integrated **development baseline**, rather tha
 
 8 unit tests, 19 API/PostgreSQL integration tests and 4 browser journeys passed. Typecheck, mobile typecheck, lint, all web/backend build checks and Expo Web export passed. The browser suite includes actual customer checkout and partner fulfilment plus representative axe/mobile-width checks. PostgreSQL/Redis, BullMQ scheduler execution, local startup and non-root API image readiness/database discovery were verified. See development-progress.md for phase history and test distinctions.
 
-Dependency audit remains failing: 2 high, 2 moderate and 1 low advisories, with no critical findings after upgrades. The high findings are in Expo development tooling without published fixes. The CI audit gate is not suppressed; hosted CI has not been observed. Native devices, Stripe, email/push, accounting, address providers, failover and backup restore remain unverified.
+Dependency audit remains failing: 2 high, 2 moderate and 1 low advisories, with no critical findings after upgrades. The high findings are in Expo development tooling without published fixes. The CI audit gate is not suppressed; hosted CI has been triggered but no completed result has been verified. Native devices, Stripe, email/push, accounting, address providers, failover and backup restore remain unverified.
 
 ## Run and review
 
@@ -31,4 +31,4 @@ Reusable cloud install/start instructions are saved as a draft, not published. O
 
 ## Git delivery
 
-Feature branch: `feature/platform-development-baseline`. Target: `main`. Draft PR requested; creation requires working GitHub API access. A read-only GitHub API request returned `Forbidden`, while Git HTTPS read and dry-run push worked. No secret is embedded in this report. The authorised push and PR creation are attempted after the final local commit; see the task response for the actual outcome.
+Feature branch: `feature/platform-development-baseline`, pushed to GitHub. Draft PR [#1](https://github.com/phouston92/thenortheats/pull/1) is open and targets `main`; draft status was verified. Initial implementation commit: `1c5d0b6`, followed by a documentation update recording delivery. GitHub API access initially failed, then PR creation succeeded without requesting or disclosing any token values. Hosted quality checks were queued/running at observation; no completed CI success is claimed. No merge occurred.
