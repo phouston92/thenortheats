@@ -2,7 +2,8 @@ name: Development quality gates
 on: [push, pull_request]
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    # Match the pinned Playwright release's supported Ubuntu LTS during runner rollouts.
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     services:
       postgres:
