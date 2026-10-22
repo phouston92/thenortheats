@@ -1,0 +1,9 @@
+# Future high availability
+
+One VPS is not high availability. This baseline keeps durable orders, fees and sessions in PostgreSQL and coordination in Redis, allowing a future pair of stateless API/frontend servers behind a TLS load balancer. Guest tracking is a client capability, not essential server state. Mail/provider development spools are local-only and must be replaced by shared external delivery before multiple servers are used.
+
+Use managed or independently operated HA PostgreSQL with replication/failover and tested point-in-time recovery; resilient Redis with supported BullMQ failover behaviour; shared S3-compatible object storage for uploads; two or more application hosts in separate failure domains; a load balancer with readiness checks and draining; immutable release images; central secrets; and off-server encrypted backups. Workers use shared queues, lock selected outbox records and pass provider idempotency keys. Migrations require a single advisory-locked release job and compatible expand/contract changes.
+
+Remaining single-node limitations include in-memory HTTP rate limiting, bootstrap MFA configuration, incomplete health checks/observability, and untested failover behaviour. Financial unique constraints/transaction locks reduce duplicate effects but do not replace failure-injection and restore tests. External provider reconciliation must be finished before multi-node payment operation.
+
+Back up PostgreSQL using an approved pgBackRest/WAL archiving or managed PITR strategy, with independently retained encrypted copies and regular isolated restores. Back up object storage separately and test Redis recovery/replay. Agree RPO/RTO with the business; none are invented here. Document switchover, migration rollback, queue replay, finance reconciliation and incident ownership before claiming HA.

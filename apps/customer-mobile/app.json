@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "The North Eats",
+    "slug": "the-north-eats",
+    "version": "0.1.0",
+    "platforms": ["ios", "android", "web"],
+    "ios": {
+      "bundleIdentifier": "uk.thenortheats.customer"
+    },
+    "android": {
+      "package": "uk.thenortheats.customer"
+    }
+  }
+}
