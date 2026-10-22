@@ -9,6 +9,10 @@ const env = {
   DATABASE_URL: url,
   REDIS_URL: process.env.REDIS_URL || "redis://127.0.0.1:6379",
   NODE_ENV: "test",
+  PORT: "3101",
+  API_ORIGIN: "http://127.0.0.1:3101",
+  EXPO_PUBLIC_API_URL: "http://localhost:3101",
+  NEXT_DIST_DIR: ".next-browser",
   ADMIN_MFA_SECRET: "JBSWY3DPEHPK3PXP",
   DEV_MAIL_DIR: "/tmp/north-browser-mail",
 };
@@ -17,7 +21,7 @@ export default defineConfig({
   workers: 1,
   timeout: 60000,
   use: {
-    baseURL: "http://localhost:3000",
+    baseURL: "http://localhost:3100",
     launchOptions: process.env.CHROMIUM_PATH
       ? { executablePath: process.env.CHROMIUM_PATH }
       : {},
@@ -25,26 +29,29 @@ export default defineConfig({
   webServer: [
     {
       command: "pnpm dev:api",
-      url: "http://localhost:3001/api/ready",
+      url: "http://localhost:3101/api/ready",
       env,
       reuseExistingServer: false,
     },
     {
-      command: "pnpm dev:web",
-      url: "http://localhost:3000",
+      command:
+        "pnpm --filter @north/customer-web exec next dev --hostname 127.0.0.1 --port 3100",
+      url: "http://localhost:3100",
       env,
       reuseExistingServer: false,
       timeout: 120000,
     },
     {
-      command: "pnpm dev:partner",
-      url: "http://localhost:5174",
+      command:
+        "pnpm --filter @north/partner-portal exec vite --host 127.0.0.1 --port 5274 --strictPort",
+      url: "http://localhost:5274",
       env,
       reuseExistingServer: false,
     },
     {
-      command: "pnpm dev:admin",
-      url: "http://localhost:5173",
+      command:
+        "pnpm --filter @north/platform-admin exec vite --host 127.0.0.1 --port 5273 --strictPort",
+      url: "http://localhost:5273",
       env,
       reuseExistingServer: false,
     },

@@ -157,3 +157,5 @@ test-results/
 # Separate Next development and build outputs
 .next-dev/
 next-env.d.ts
+
+.next-browser/

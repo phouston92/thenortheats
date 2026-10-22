@@ -3,6 +3,7 @@ export interface PaymentProvider {
   intent(
     order: { id: string; total: number; service_fee: number },
     account: string,
+    existingIntentId?: string,
   ): Promise<{ id: string; clientSecret: string | null }>;
   refund(
     intent: string,
@@ -37,18 +38,32 @@ export class StripeProvider implements PaymentProvider {
   async intent(
     order: { id: string; total: number; service_fee: number },
     account: string,
+    existingIntentId?: string,
   ) {
     await this.ready(account);
-    const p = await this.stripe.paymentIntents.create(
-      {
-        amount: order.total,
-        currency: "gbp",
-        application_fee_amount: order.service_fee,
-        automatic_payment_methods: { enabled: true },
-        metadata: { orderId: order.id },
-      },
-      { stripeAccount: account, idempotencyKey: "order:" + order.id },
-    );
+    const p = existingIntentId
+      ? await this.stripe.paymentIntents.retrieve(
+          existingIntentId,
+          {},
+          { stripeAccount: account },
+        )
+      : await this.stripe.paymentIntents.create(
+          {
+            amount: order.total,
+            currency: "gbp",
+            application_fee_amount: order.service_fee,
+            automatic_payment_methods: { enabled: true },
+            metadata: { orderId: order.id },
+          },
+          { stripeAccount: account, idempotencyKey: "order:" + order.id },
+        );
+    if (
+      p.amount !== order.total ||
+      p.currency !== "gbp" ||
+      (p.application_fee_amount ?? 0) !== order.service_fee ||
+      p.metadata.orderId !== order.id
+    )
+      throw new Error("Payment intent reconciliation mismatch");
     return { id: p.id, clientSecret: p.client_secret };
   }
   async capture(intent: string, account: string, key: string) {
@@ -70,6 +85,7 @@ export class StripeProvider implements PaymentProvider {
         payment_intent: intent,
         amount,
         refund_application_fee: refundServiceFee,
+        metadata: { refundRequestKey: key },
       },
       { stripeAccount: account, idempotencyKey: key },
     );

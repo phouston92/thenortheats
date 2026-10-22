@@ -1,5 +1,7 @@
 # Delivery report
 
+**PR #1 stabilisation follow-up:** see [stabilization-review.md](stabilization-review.md) for changed files, security exposure and regression fixes. Current local totals are **24 unit, 35 integration and 4 browser tests passing**, with **2 high and 1 moderate** unresolved advisories and no audit suppression. Exact hosted run outcomes are recorded in the updated PR description and task response. The sections below describe the original baseline delivery.
+
 ## Scope
 
 The North Eats now has a working integrated **development baseline**, rather than an empty repository. Phase 1 foundations are implemented; Phases 2–4 have functional core slices and substantial outstanding requirements. See requirements-coverage.md for detailed omissions; this report must not be read as complete implementation of the master brief.

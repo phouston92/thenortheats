@@ -23,6 +23,7 @@
     "**/node_modules",
     "**/.next",
     "**/.next-dev",
+    "**/.next-browser",
     "apps/customer-mobile"
   ]
 }

@@ -13,3 +13,7 @@ Tenant access uses bound SQL parameters and explicit membership predicates. SQL 
 Back up before migration. Migrations run inside one PostgreSQL transaction, protected against concurrent runners. No automatic destructive down migrations are supplied. For failed application releases, revert the application only when compatible with the current schema. Otherwise restore a tested backup into a separate database and reconcile lost writes before switching; never casually reverse financial history.
 
 See requirements-coverage.md for the complete list of entity areas not yet implemented.
+
+## PR #1 stabilisation migrations
+
+0006 installs an access-change trigger that revokes sessions on role/disabled changes; 0007 revokes legacy sessions once on upgrade. 0008 adds nullable immutable ledger tax snapshots without changing existing financial rows. New credits store cumulative tax reversals and invoices use explicit snapshots with a legacy fallback. Apply these migrations before running the updated API. Session logout is intentional; business data is not removed.

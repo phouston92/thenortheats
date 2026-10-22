@@ -33,7 +33,12 @@ export async function actor(db: Database, req: FastifyRequest): Promise<Actor> {
     throw Object.assign(new Error("Invalid CSRF token"), { statusCode: 403 });
   const memberships =
     await db`SELECT partner_id FROM memberships WHERE user_id=${u.id}`;
-  return { ...u, partners: memberships.map((x) => x.partner_id) } as Actor;
+  return {
+    ...u,
+    partners: ["owner", "operator"].includes(u.role)
+      ? memberships.map((x) => x.partner_id)
+      : [],
+  } as Actor;
 }
 export function admin(a: Actor) {
   if (a.role !== "admin")
@@ -135,7 +140,8 @@ export async function authRoutes(app: FastifyInstance, db: Database) {
           )
         )
           return null;
-        let [u] = await tx`SELECT * FROM users WHERE email=${c.email}`;
+        let [u] =
+          await tx`SELECT * FROM users WHERE email=${c.email} FOR SHARE`;
         if (!u) {
           [u] =
             await tx`INSERT INTO users(email,role) VALUES(${c.email},'customer') ON CONFLICT(email) DO UPDATE SET email=EXCLUDED.email RETURNING *`;

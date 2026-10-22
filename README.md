@@ -57,6 +57,8 @@ pnpm --filter @north/customer-mobile export
 pnpm audit --audit-level high
 ```
 
-When an existing system Chromium is available, `CHROMIUM_PATH=/usr/bin/chromium pnpm test:browser` avoids downloading another copy. Browser tests start their own API, all three web apps and Expo Web and insert clearly named deterministic test fixtures. Stop ordinary development servers on those ports first. Browser MFA fixtures are test-only and cannot be used by the ordinary `.env` setup.
+When an existing system Chromium is available, `CHROMIUM_PATH=/usr/bin/chromium pnpm test:browser` avoids downloading another copy. Browser tests start their own API (3101), customer site (3100), partner portal (5274), admin (5273) and Expo Web (8081), with a separate `.next-browser` cache. They insert clearly named deterministic fixtures. Leave those test ports free; ordinary development servers use different ports. Browser MFA fixtures are test-only and cannot be used by the ordinary `.env` setup.
 
-See [development results](docs/development-progress.md), [requirements coverage](docs/requirements-coverage.md), [open decisions](docs/open-decisions.md) and [security](docs/security.md). The dependency audit currently fails on two high-severity Expo tooling advisories without published fixes; no exceptions are hidden in CI.
+See [development results](docs/development-progress.md), [requirements coverage](docs/requirements-coverage.md), [open decisions](docs/open-decisions.md) and [security](docs/security.md). The dependency audit currently fails on two high-severity Expo tooling advisories without published fixes (plus one moderate finding); no exceptions are hidden in CI.
+
+Review follow-up: [PR #1 stabilisation report](docs/stabilization-review.md). Access-change migrations revoke existing sessions once; run migrations before starting the updated API.

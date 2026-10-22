@@ -58,7 +58,7 @@ test("administrator signs in with MFA, reviews live dashboard and adds pending p
 }) => {
   await login(
     page,
-    "http://localhost:5173",
+    "http://localhost:5273",
     "browser-admin@example.test",
     true,
   );
@@ -128,7 +128,7 @@ test("customer cash checkout → partner completion → customer tracking uses r
   ).toBeVisible();
   const context = await browser.newContext();
   const partner = await context.newPage();
-  await login(partner, "http://localhost:5174", "browser-owner@example.test");
+  await login(partner, "http://localhost:5274", "browser-owner@example.test");
   await expect(
     partner.getByRole("heading", { name: "Orders", exact: true }),
   ).toBeVisible();

@@ -29,7 +29,7 @@
   },
   "devDependencies": {
     "typescript": "5.9.3",
-    "tsx": "4.21.0",
+    "tsx": "4.23.15",
     "vitest": "4.1.12",
     "@types/node": "22.19.7",
     "@types/react": "19.2.7",
@@ -62,7 +62,8 @@
     "overrides": {
       "postcss": "8.5.23",
       "sharp": "0.35.5",
-      "image-size": "2.0.3"
+      "image-size": "2.0.3",
+      "bullmq>uuid": "11.1.1"
     }
   },
   "type": "module"

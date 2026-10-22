@@ -23,7 +23,7 @@ export async function completeFees(tx: Query, o: any) {
       ? [["cash_service_fee", o.service_fee]]
       : []),
   ] as [string, number][])
-    await tx`INSERT INTO ledger_entries(partner_id,order_id,reference,kind,amount,vat_basis_points,tax_confirmed) VALUES(${o.partner_id},${o.id},${o.id + ":" + kind},${kind},${amount},${p.vat_basis_points},${p.tax_confirmed}) ON CONFLICT(reference) DO NOTHING`;
+    await tx`INSERT INTO ledger_entries(partner_id,order_id,reference,kind,amount,vat_basis_points,tax_confirmed,vat_amount) VALUES(${o.partner_id},${o.id},${o.id + ":" + kind},${kind},${amount},${p.vat_basis_points},${p.tax_confirmed},${ratio(amount, p.vat_basis_points, 10000)}) ON CONFLICT(reference) DO NOTHING`;
 }
 export async function invoice(db: Database, partnerId: string, start: string) {
   const parsed = z.iso.date().parse(start);
@@ -43,13 +43,14 @@ export async function invoice(db: Database, partnerId: string, start: string) {
       await tx`SELECT l.* FROM ledger_entries l WHERE l.partner_id=${partnerId} AND l.created_at<${end}::date AND NOT EXISTS(SELECT 1 FROM invoice_lines il WHERE il.ledger_id=l.id) ORDER BY l.created_at,l.id FOR UPDATE`;
     const net = entries.reduce((s, l) => s + l.amount, 0);
     const vat = entries.reduce(
-      (s, l) => s + ratio(l.amount, l.vat_basis_points, 10000),
+      (s, l) =>
+        s + (l.vat_amount ?? ratio(l.amount, l.vat_basis_points, 10000)),
       0,
     );
     const [row] =
       await tx`INSERT INTO invoices(partner_id,period_start,period_end,net,vat,total) VALUES(${partnerId},${parsed},${end},${net},${vat},${net + vat}) RETURNING *`;
     for (const l of entries)
-      await tx`INSERT INTO invoice_lines(invoice_id,ledger_id,description,net,vat) VALUES(${row.id},${l.id},${l.kind + " " + (l.order_id || "")},${l.amount},${ratio(l.amount, l.vat_basis_points, 10000)})`;
+      await tx`INSERT INTO invoice_lines(invoice_id,ledger_id,description,net,vat) VALUES(${row.id},${l.id},${l.kind + " " + (l.order_id || "")},${l.amount},${l.vat_amount ?? ratio(l.amount, l.vat_basis_points, 10000)})`;
     return row;
   });
 }
@@ -78,7 +79,9 @@ export async function orderRoutes(
         throw fail("Use customer checkout account", 403);
       customerId = a.id;
     }
-    const fingerprint = hash(JSON.stringify(v) + hash(token));
+    const fingerprint = hash(
+      JSON.stringify(v) + hash(token) + (customerId ?? "guest"),
+    );
     const result = await db.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtextextended(${requestKey},2))`;
       const [existing] =
@@ -168,10 +171,30 @@ export async function orderRoutes(
           total: number;
           service_fee: number;
           stripe_account: string;
+          provider_id: string | null;
+          updated_at: Date;
+          status: string;
         }[]
-      >`SELECT o.*,p.stripe_account FROM orders o JOIN payments p ON p.order_id=o.id WHERE o.id=${result.id}`;
-      const intent = await provider().intent(o, o.stripe_account);
-      await db`UPDATE payments SET provider_id=${intent.id} WHERE order_id=${o.id}`;
+      >`SELECT o.*,p.stripe_account,p.provider_id,p.updated_at FROM orders o JOIN payments p ON p.order_id=o.id WHERE o.id=${result.id}`;
+      if (o.status !== "awaiting_payment")
+        return reply.code(201).send({ id: o.id });
+      // Stripe may prune idempotency keys after 24 hours. Retrieve known intents,
+      // and fail closed for old interrupted creation instead of risking a second charge.
+      if (
+        !o.provider_id &&
+        Date.now() - new Date(o.updated_at).getTime() >= 23 * 60 * 60 * 1000
+      )
+        throw fail(
+          "Interrupted payment requires provider reconciliation before retry",
+        );
+      const intent = await provider().intent(
+        o,
+        o.stripe_account,
+        o.provider_id ?? undefined,
+      );
+      const bound =
+        await db`UPDATE payments SET provider_id=${intent.id} WHERE order_id=${o.id} AND (provider_id IS NULL OR provider_id=${intent.id}) RETURNING id`;
+      if (!bound.length) throw fail("Payment provider identity mismatch");
       return reply
         .code(201)
         .send({ id: o.id, clientSecret: intent.clientSecret });
@@ -190,7 +213,8 @@ export async function orderRoutes(
       allowed =
         a.role === "admin" ||
         o.customer_id === a.id ||
-        a.partners.includes(o.partner_id);
+        (["owner", "operator"].includes(a.role) &&
+          a.partners.includes(o.partner_id));
     }
     if (!allowed) return reply.code(404).send({ error: "Order not found" });
     delete o.tracking_hash;
@@ -323,6 +347,10 @@ export async function orderRoutes(
           prior.refund_service_fee !== v.refundServiceFee
         )
           throw fail("Refund key conflict");
+        if (prior.status === "failed")
+          throw fail(
+            "Failed refund is terminal; use a new request key after reconciliation",
+          );
         return { o, refund: prior };
       }
       if (
@@ -344,7 +372,22 @@ export async function orderRoutes(
         await tx`INSERT INTO refunds(order_id,request_key,amount,status,refund_service_fee) VALUES(${o.id},${v.requestKey},${v.amount},'pending',${v.refundServiceFee}) RETURNING *`;
       return { o, refund: r };
     });
-    if (reservation.refund.status === "succeeded") return reservation.refund;
+    if (
+      reservation.refund.status === "succeeded" ||
+      reservation.refund.provider_id
+    )
+      return {
+        id: reservation.refund.id,
+        status: reservation.refund.status,
+        amount: reservation.refund.amount,
+      };
+    if (
+      Date.now() - new Date(reservation.refund.created_at).getTime() >=
+      23 * 60 * 60 * 1000
+    )
+      throw fail(
+        "Interrupted refund requires provider reconciliation before retry",
+      );
     const [payment] =
       await db`SELECT * FROM payments WHERE order_id=${orderId}`;
     const res = await provider().refund(
@@ -355,8 +398,16 @@ export async function orderRoutes(
       reservation.refund.refund_service_fee,
     );
     if (res.status !== "succeeded") {
-      await db`UPDATE refunds SET provider_id=${res.id},status=${res.status === "failed" ? "failed" : "pending"} WHERE id=${reservation.refund.id}`;
-      return { status: res.status };
+      // A signed webhook may settle while the original HTTP response is in flight.
+      // Never downgrade a terminal result with a stale pending/failed response.
+      const [current] =
+        await db`UPDATE refunds SET provider_id=${res.id},status=${["failed", "canceled"].includes(res.status) ? "failed" : "pending"} WHERE id=${reservation.refund.id} AND status='pending' AND (provider_id IS NULL OR provider_id=${res.id}) RETURNING status`;
+      if (current) return { status: current.status };
+      const [settled] =
+        await db`SELECT status,provider_id FROM refunds WHERE id=${reservation.refund.id}`;
+      if (settled?.provider_id !== res.id)
+        throw fail("Refund provider identity mismatch");
+      return { status: settled.status };
     }
     return settleRefund(db, reservation.refund.id, res.id, a.id);
   });
@@ -367,33 +418,65 @@ export async function settleRefund(
   providerId: string,
   actorId: string | null,
 ) {
-  return db.begin(async (tx) => {
-    const [r] = await tx`SELECT * FROM refunds WHERE id=${refundId} FOR UPDATE`;
-    if (!r) throw fail("Unknown refund");
-    if (r.status === "succeeded") return r;
-    const [o] =
-      await tx`SELECT * FROM orders WHERE id=${r.order_id} FOR UPDATE`;
-    const cumulative = o.refunded_amount + r.amount;
-    if (cumulative > o.total) throw fail("Refund exceeds payment");
-    // Reverse fees cumulatively to avoid penny drift over many partial refunds.
-    for (const [kind, fee] of [
-      ["partner_fee", o.partner_fee],
-      ...(o.payment_method === "cash" && r.refund_service_fee
-        ? [["cash_service_fee", o.service_fee]]
-        : []),
-    ] as [string, number][]) {
-      const [original] =
-        await tx`SELECT id FROM ledger_entries WHERE reference=${o.id + ":" + kind}`;
-      if (!original) continue;
-      const adjustment =
-        ratio(fee, cumulative, o.total) -
-        ratio(fee, o.refunded_amount, o.total);
-      if (adjustment)
-        await tx`INSERT INTO ledger_entries(partner_id,order_id,reference,kind,amount,vat_basis_points,tax_confirmed) VALUES(${o.partner_id},${o.id},${r.id + ":" + kind},'fee_credit',${-adjustment},${o.pricing_snapshot.vat_basis_points},${o.pricing_snapshot.tax_confirmed}) ON CONFLICT DO NOTHING`;
-    }
-    await tx`UPDATE refunds SET status='succeeded',provider_id=${providerId} WHERE id=${r.id}`;
-    await tx`UPDATE orders SET refunded_amount=${cumulative},payment_state=${cumulative === o.total ? "refunded" : "partially_refunded"} WHERE id=${o.id}`;
-    await tx`INSERT INTO audit_logs(actor_id,partner_id,action,subject) VALUES(${actorId},${o.partner_id},'refund.settled',${r.id})`;
-    return { id: r.id, status: "succeeded", amount: r.amount };
-  });
+  return db.begin((tx) =>
+    settleRefundInTransaction(tx, refundId, providerId, actorId),
+  );
+}
+export async function settleRefundInTransaction(
+  tx: Query,
+  refundId: string,
+  providerId: string,
+  actorId: string | null,
+) {
+  const [lookup] = await tx`SELECT order_id FROM refunds WHERE id=${refundId}`;
+  if (!lookup) throw fail("Unknown refund");
+  // Match the reservation path's lock order: order first, refund second.
+  const [o] =
+    await tx`SELECT * FROM orders WHERE id=${lookup.order_id} FOR UPDATE`;
+  const [r] = await tx`SELECT * FROM refunds WHERE id=${refundId} FOR UPDATE`;
+  if (r.provider_id && r.provider_id !== providerId)
+    throw fail("Refund provider identity mismatch");
+  if (r.status === "succeeded")
+    return { id: r.id, status: r.status, amount: r.amount };
+  if (r.status !== "pending")
+    throw fail("Refund is terminal; reconciliation required");
+  const cumulative = o.refunded_amount + r.amount;
+  if (cumulative > o.total) throw fail("Refund exceeds payment");
+  // Reverse fees cumulatively to avoid penny drift over many partial refunds.
+  for (const [kind, fee] of [
+    ["partner_fee", o.partner_fee],
+    ...(o.payment_method === "cash" && r.refund_service_fee
+      ? [["cash_service_fee", o.service_fee]]
+      : []),
+  ] as [string, number][]) {
+    const [original] =
+      await tx`SELECT amount,vat_basis_points,tax_confirmed,vat_amount FROM ledger_entries WHERE reference=${o.id + ":" + kind}`;
+    if (!original) continue;
+    const adjustment =
+      ratio(fee, cumulative, o.total) - ratio(fee, o.refunded_amount, o.total);
+    const originalVat =
+      original.vat_amount ??
+      ratio(original.amount, original.vat_basis_points, 10000);
+    const previousCredits =
+      await tx`SELECT amount,vat_basis_points,vat_amount FROM ledger_entries WHERE order_id=${o.id} AND kind='fee_credit' AND reference LIKE ${"%:" + kind}`;
+    const alreadyReversedVat = -previousCredits.reduce(
+      (sum, l) =>
+        sum + (l.vat_amount ?? ratio(l.amount, l.vat_basis_points, 10000)),
+      0,
+    );
+    const targetVat =
+      fee === 0 ? 0 : ratio(originalVat, ratio(fee, cumulative, o.total), fee);
+    const vatAdjustment = targetVat - alreadyReversedVat;
+    // Carry cumulative tax rounding explicitly; never recompute each partial
+    // credit independently (three 33/34/33p credits must reverse exactly 20p VAT).
+    if (adjustment || vatAdjustment)
+      await tx`INSERT INTO ledger_entries(partner_id,order_id,reference,kind,amount,vat_basis_points,tax_confirmed,vat_amount) VALUES(${o.partner_id},${o.id},${r.id + ":" + kind},'fee_credit',${-adjustment},${original.vat_basis_points},${original.tax_confirmed},${-vatAdjustment}) ON CONFLICT DO NOTHING`;
+  }
+  const paymentState =
+    cumulative === o.total ? "refunded" : "partially_refunded";
+  await tx`UPDATE refunds SET status='succeeded',provider_id=${providerId} WHERE id=${r.id}`;
+  await tx`UPDATE orders SET refunded_amount=${cumulative},payment_state=${paymentState} WHERE id=${o.id}`;
+  await tx`UPDATE payments SET state=${paymentState},updated_at=now() WHERE order_id=${o.id}`;
+  await tx`INSERT INTO audit_logs(actor_id,partner_id,action,subject) VALUES(${actorId},${o.partner_id},'refund.settled',${r.id})`;
+  return { id: r.id, status: "succeeded", amount: r.amount };
 }

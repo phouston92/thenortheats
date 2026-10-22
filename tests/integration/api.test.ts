@@ -6,6 +6,8 @@ import { migrate } from "../../packages/database/src/migrate";
 import { seed } from "../../packages/database/src/seed";
 import { createApp } from "../../apps/api/src/app";
 import Stripe from "stripe";
+import { TOTP, Secret } from "otpauth";
+import type { PaymentProvider } from "../../packages/payments/src/index";
 import { weekStart } from "../../packages/shared/src/index";
 import { hash } from "../../apps/api/src/auth";
 const url = process.env.TEST_DATABASE_URL;
@@ -15,15 +17,21 @@ if (!url || !new URL(url).pathname.endsWith("_test"))
   );
 process.env.DEV_MAIL_DIR = "/tmp/north-integration-mail";
 const db = connect(url);
-const app = await createApp(db, {
-  intent: async (o) => ({
-    id: "pi_" + o.id,
-    clientSecret: "test_fixture_only",
-  }),
-  refund: async (_intent, _account, _amount, key) => ({
+const refundProvider = vi
+  .fn<PaymentProvider["refund"]>()
+  .mockImplementation(async (_intent, _account, _amount, key) => ({
     id: "re_" + key,
     status: "succeeded",
-  }),
+  }));
+const intentProvider = vi
+  .fn<PaymentProvider["intent"]>()
+  .mockImplementation(async (o) => ({
+    id: "pi_" + o.id,
+    clientSecret: "test_fixture_only",
+  }));
+const app = await createApp(db, {
+  intent: intentProvider,
+  refund: refundProvider,
   capture: async () => {},
 });
 const p1 = "10000000-0000-4000-8000-000000000001",
@@ -204,6 +212,10 @@ describe("phase 2 API boundaries", () => {
 });
 export { db, app, p1, p2 };
 
+const capturedPaymentEventId =
+  "00000000-0000-4000-8000-000000000001" satisfies ReturnType<
+    typeof crypto.randomUUID
+  >;
 describe("phase 3 order and billing scenarios", () => {
   let cashId: string, cardId: string;
   const tracking = "a".repeat(64);
@@ -241,7 +253,8 @@ describe("phase 3 order and billing scenarios", () => {
   ) {
     process.env.STRIPE_SECRET_KEY = "sk_test_fixture_not_a_credential";
     process.env.STRIPE_WEBHOOK_SECRET = "whsec_fixture";
-    const [o] = await db`SELECT total FROM orders WHERE id=${orderId}`;
+    const [o] =
+      await db`SELECT total,service_fee FROM orders WHERE id=${orderId}`;
     const payload = JSON.stringify({
       id: eventId,
       object: "event",
@@ -254,6 +267,7 @@ describe("phase 3 order and billing scenarios", () => {
           object: "payment_intent",
           metadata: { orderId },
           amount: o.total,
+          application_fee_amount: o.service_fee,
           amount_received: type === "payment_intent.succeeded" ? o.total : 0,
           currency: "gbp",
         },
@@ -372,12 +386,22 @@ describe("phase 3 order and billing scenarios", () => {
       ).statusCode,
     ).toBe(503);
     expect(
-      (await webhook(cardId, "payment_intent.succeeded", "evt_success"))
-        .statusCode,
+      (
+        await webhook(
+          cardId,
+          "payment_intent.succeeded",
+          capturedPaymentEventId,
+        )
+      ).statusCode,
     ).toBe(200);
     expect(
-      (await webhook(cardId, "payment_intent.succeeded", "evt_success")).json()
-        .duplicate,
+      (
+        await webhook(
+          cardId,
+          "payment_intent.succeeded",
+          capturedPaymentEventId,
+        )
+      ).json().duplicate,
     ).toBe(true);
     expect(
       (
@@ -486,6 +510,615 @@ describe("phase 3 order and billing scenarios", () => {
       const lines =
         await db`SELECT ledger_id FROM invoice_lines WHERE invoice_id=${a.json().id}`;
       expect(new Set(lines.map((x) => x.ledger_id)).size).toBe(lines.length);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  async function signedEvent(
+    type: string,
+    object: unknown,
+    options: {
+      account?: string;
+      eventId?: ReturnType<typeof crypto.randomUUID>;
+      live?: boolean;
+    } = {},
+  ) {
+    process.env.STRIPE_SECRET_KEY = "sk_test_fixture_not_a_credential";
+    process.env.STRIPE_WEBHOOK_SECRET = "whsec_fixture";
+    const eventId = options.eventId ?? crypto.randomUUID();
+    const payload = JSON.stringify({
+      id: eventId,
+      object: "event",
+      type,
+      account: options.account ?? "acct_fixture",
+      livemode: options.live ?? false,
+      data: { object },
+    });
+    const signature = Stripe.webhooks.generateTestHeaderString({
+      payload,
+      secret: "whsec_fixture",
+    });
+    return app.inject({
+      method: "POST",
+      url: "/api/webhooks/stripe",
+      headers: {
+        "content-type": "application/json",
+        "stripe-signature": signature,
+      },
+      payload,
+    });
+  }
+  async function capturedCard(complete = true) {
+    const res = await checkout("card");
+    expect(res.statusCode).toBe(201);
+    const orderId: string = res.json().id;
+    expect(
+      (await webhook(orderId, "payment_intent.succeeded")).statusCode,
+    ).toBe(200);
+    if (complete)
+      for (const state of ["accepted", "preparing", "ready", "completed"])
+        expect((await transition(orderId, state)).statusCode).toBe(200);
+    return orderId;
+  }
+  function refundRequest(
+    orderId: string,
+    amount: number,
+    key = crypto.randomUUID(),
+    refundServiceFee = true,
+  ) {
+    return {
+      method: "POST" as const,
+      url: `/api/admin/orders/${orderId}/refund`,
+      headers: admin,
+      payload: { amount, requestKey: key, refundServiceFee },
+    };
+  }
+  function refundObject(
+    orderId: string,
+    amount: number,
+    key: string,
+    status = "succeeded",
+  ) {
+    return {
+      id: "re_" + key,
+      object: "refund",
+      amount,
+      currency: "gbp",
+      payment_intent: "pi_" + orderId,
+      status,
+      metadata: { refundRequestKey: key },
+    };
+  }
+  it("rejects mismatched payment allocation/account/amount and rolls back deduplication", async () => {
+    const order = (await checkout("card")).json().id;
+    const pi = {
+      id: "pi_" + order,
+      object: "payment_intent",
+      metadata: { orderId: order },
+      amount: 1050,
+      amount_received: 1050,
+      currency: "gbp",
+      application_fee_amount: 100,
+    };
+    for (const invalid of [
+      { amount: 1051 },
+      { amount_received: 1049 },
+      { currency: "usd" },
+      { application_fee_amount: 99 },
+      { metadata: { orderId: p2 } },
+    ]) {
+      const eventId = crypto.randomUUID();
+      expect(
+        (
+          await signedEvent(
+            "payment_intent.succeeded",
+            { ...pi, ...invalid },
+            { eventId },
+          )
+        ).statusCode,
+      ).toBe(409);
+      expect(
+        (await db`SELECT * FROM webhook_events WHERE provider_id=${eventId}`)
+          .length,
+      ).toBe(0);
+    }
+    expect(
+      (
+        await signedEvent("payment_intent.succeeded", pi, {
+          account: "acct_other",
+        })
+      ).statusCode,
+    ).toBe(409);
+    expect(
+      (await signedEvent("payment_intent.succeeded", pi, { live: true }))
+        .statusCode,
+    ).toBe(400);
+    const eventId = crypto.randomUUID();
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        signedEvent("payment_intent.succeeded", pi, { eventId }),
+      ),
+    );
+    expect(responses.every((r) => r.statusCode === 200)).toBe(true);
+    expect(responses.filter((r) => r.json().duplicate).length).toBe(4);
+    expect(
+      (
+        await db`SELECT * FROM order_history WHERE order_id=${order} AND status='awaiting_acceptance'`
+      ).length,
+    ).toBe(1);
+    expect(
+      (
+        await db`SELECT * FROM notifications WHERE order_id=${order} AND kind='new_order'`
+      ).length,
+    ).toBe(1);
+  });
+  it("cumulative penny refunds and full retries preserve both payment states and credits", async () => {
+    const order = await capturedCard();
+    let last;
+    for (let i = 0; i < 3; i++) {
+      last = refundRequest(order, 350, crypto.randomUUID(), false);
+      expect((await app.inject(last)).statusCode).toBe(200);
+    }
+    expect((await app.inject(last!)).statusCode).toBe(200);
+    expect(
+      (
+        await app.inject({
+          ...last!,
+          payload: { ...last!.payload, refundServiceFee: true },
+        })
+      ).statusCode,
+    ).toBe(409);
+    const credits =
+      await db`SELECT amount FROM ledger_entries WHERE order_id=${order} AND kind='fee_credit' ORDER BY created_at`;
+    expect(credits.map((c) => c.amount)).toEqual([-33, -34, -33]);
+    await webhook(order, "payment_intent.succeeded");
+    await webhook(order, "payment_intent.payment_failed");
+    expect(
+      (
+        await db`SELECT payment_state,refunded_amount FROM orders WHERE id=${order}`
+      )[0],
+    ).toMatchObject({ payment_state: "refunded", refunded_amount: 1050 });
+    expect(
+      (await db`SELECT state FROM payments WHERE order_id=${order}`)[0].state,
+    ).toBe("refunded");
+    expect(refundProvider).toHaveBeenLastCalledWith(
+      "pi_" + order,
+      "acct_fixture",
+      350,
+      last!.payload.requestKey,
+      false,
+    );
+  });
+  it("validates pending refund webhooks and deduplicates settlement transactionally", async () => {
+    const order = await capturedCard();
+    const key = crypto.randomUUID();
+    refundProvider.mockImplementationOnce(async () => ({
+      id: "re_" + key,
+      status: "pending",
+    }));
+    expect(
+      (await app.inject(refundRequest(order, 350, key))).json().status,
+    ).toBe("pending");
+    const pendingCalls = refundProvider.mock.calls.length;
+    expect(
+      (await app.inject(refundRequest(order, 350, key))).json().status,
+    ).toBe("pending");
+    expect(refundProvider.mock.calls.length).toBe(pendingCalls);
+    const object = refundObject(order, 350, key);
+    for (const invalid of [
+      { amount: 351 },
+      { currency: "usd" },
+      { payment_intent: "pi_other" },
+    ])
+      expect(
+        (await signedEvent("refund.updated", { ...object, ...invalid }))
+          .statusCode,
+      ).toBe(409);
+    expect(
+      (await signedEvent("refund.updated", object, { account: "acct_other" }))
+        .statusCode,
+    ).toBe(409);
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(0);
+    const eventId = crypto.randomUUID();
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () =>
+        signedEvent("refund.updated", object, { eventId }),
+      ),
+    );
+    expect(results.every((r) => r.statusCode === 200)).toBe(true);
+    expect(results.filter((r) => r.json().duplicate).length).toBe(3);
+    expect(
+      (
+        await db`SELECT refunded_amount,payment_state FROM orders WHERE id=${order}`
+      )[0],
+    ).toMatchObject({
+      refunded_amount: 350,
+      payment_state: "partially_refunded",
+    });
+    expect(
+      (await db`SELECT state FROM payments WHERE order_id=${order}`)[0].state,
+    ).toBe("partially_refunded");
+    expect(
+      (
+        await db`SELECT * FROM ledger_entries WHERE order_id=${order} AND kind='fee_credit'`
+      ).length,
+    ).toBe(1);
+  });
+  it("a webhook racing the HTTP refund response cannot be downgraded to pending", async () => {
+    const order = await capturedCard();
+    const key = crypto.randomUUID();
+    refundProvider.mockImplementationOnce(async () => {
+      expect(
+        (await signedEvent("refund.created", refundObject(order, 350, key)))
+          .statusCode,
+      ).toBe(200);
+      return { id: "re_" + key, status: "pending" };
+    });
+    expect(
+      (await app.inject(refundRequest(order, 350, key))).json().status,
+    ).toBe("succeeded");
+    expect(
+      (
+        await signedEvent(
+          "refund.updated",
+          refundObject(order, 350, key, "failed"),
+        )
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (await db`SELECT status FROM refunds WHERE request_key=${key}`)[0].status,
+    ).toBe("succeeded");
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(350);
+  });
+  it("recovers a signed refund success after an interrupted provider response", async () => {
+    const order = await capturedCard();
+    const key = crypto.randomUUID();
+    refundProvider.mockRejectedValueOnce(
+      new Error("simulated interrupted provider response"),
+    );
+    const request = refundRequest(order, 350, key);
+    expect((await app.inject(request)).statusCode).toBe(500);
+    await db`UPDATE refunds SET created_at=now()-interval '25 hours' WHERE request_key=${key}`;
+    const attempts = refundProvider.mock.calls.length;
+    expect((await app.inject(request)).statusCode).toBe(409);
+    expect(refundProvider.mock.calls.length).toBe(attempts);
+
+    expect(
+      (await db`SELECT provider_id FROM refunds WHERE request_key=${key}`)[0]
+        .provider_id,
+    ).toBeNull();
+    expect(
+      (await signedEvent("refund.updated", refundObject(order, 350, key)))
+        .statusCode,
+    ).toBe(200);
+    const before = refundProvider.mock.calls.length;
+    expect((await app.inject(request)).json().status).toBe("succeeded");
+    expect(refundProvider.mock.calls.length).toBe(before);
+  });
+  it("blocks over-refunds, concurrent reservations and terminal failed-key reuse", async () => {
+    const order = await capturedCard();
+    const failedKey = crypto.randomUUID();
+    refundProvider.mockImplementationOnce(async () => ({
+      id: "re_" + failedKey,
+      status: "failed",
+    }));
+    expect(
+      (await app.inject(refundRequest(order, 350, failedKey))).json().status,
+    ).toBe("failed");
+    const pendingKey = crypto.randomUUID();
+    refundProvider.mockImplementationOnce(async () => ({
+      id: "re_" + pendingKey,
+      status: "pending",
+    }));
+    expect(
+      (await app.inject(refundRequest(order, 800, pendingKey))).statusCode,
+    ).toBe(200);
+    const before = refundProvider.mock.calls.length;
+    expect(
+      (await app.inject(refundRequest(order, 350, failedKey))).statusCode,
+    ).toBe(409);
+    expect((await app.inject(refundRequest(order, 300))).statusCode).toBe(409);
+    expect(refundProvider.mock.calls.length).toBe(before);
+    expect(
+      (
+        await signedEvent(
+          "refund.updated",
+          refundObject(order, 800, pendingKey),
+        )
+      ).statusCode,
+    ).toBe(200);
+    expect((await app.inject(refundRequest(order, 251))).statusCode).toBe(409);
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(800);
+  });
+  it("denies cross-tenant order, invoice and product access", async () => {
+    const other = await session("owner", "other-owner@test.local", p2);
+    expect(
+      (await app.inject({ url: "/api/orders/" + cashId, headers: other }))
+        .statusCode,
+    ).toBe(404);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/partner/${p2}/orders/${cashId}/transition`,
+          headers: other,
+          payload: { status: "cancelled", reason: "Wrong tenant" },
+        })
+      ).statusCode,
+    ).toBe(404);
+    const [inv] =
+      await db`SELECT id FROM invoices WHERE partner_id=${p1} LIMIT 1`;
+    expect(
+      (await app.inject({ url: "/api/invoices/" + inv.id, headers: other }))
+        .statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/partner/${p2}/products/${p1.slice(0, -1) + "3"}`,
+          headers: other,
+          payload: { available: false },
+        })
+      ).statusCode,
+    ).toBe(404);
+  });
+  it("binds checkout idempotency to the authenticated customer as well as the tracking token", async () => {
+    const first = await session("customer", "checkout-a@test.local"),
+      second = await session("customer", "checkout-b@test.local");
+    const request = {
+      method: "POST" as const,
+      url: "/api/orders",
+      headers: {
+        ...first,
+        "idempotency-key": crypto.randomUUID(),
+        "x-order-token": tracking,
+      },
+      payload: {
+        partnerId: p1,
+        items: [{ productId: p1.slice(0, -1) + "3", quantity: 1 }],
+        customerName: "Identity Bound",
+        customerEmail: "identity@example.test",
+        fulfilment: "collection",
+        paymentMethod: "cash",
+      },
+    };
+    expect((await app.inject(request)).statusCode).toBe(201);
+    expect(
+      (
+        await app.inject({
+          ...request,
+          headers: { ...request.headers, ...second },
+        })
+      ).statusCode,
+    ).toBe(409);
+  });
+  it("stale memberships cannot grant customer accounts partner privileges", async () => {
+    const headers = await session("customer", "stale-member@test.local", p1);
+    expect(
+      (await app.inject({ url: "/api/auth/me", headers })).json().user.partners,
+    ).toEqual([]);
+    expect(
+      (await app.inject({ url: "/api/orders/" + cashId, headers })).statusCode,
+    ).toBe(404);
+    expect(
+      (await app.inject({ url: `/api/partner/${p1}/finance`, headers }))
+        .statusCode,
+    ).toBe(403);
+  });
+  it("role/disabled changes revoke existing sessions without revival on restoration", async () => {
+    for (const field of ["role", "disabled"] as const) {
+      const email = `revoke-${field}@test.local`;
+      const headers = await session("operator", email, p1);
+      if (field === "role")
+        await db`UPDATE users SET role='admin' WHERE email=${email}`;
+      else await db`UPDATE users SET disabled=true WHERE email=${email}`;
+      expect(
+        (await app.inject({ url: "/api/auth/me", headers })).statusCode,
+      ).toBe(401);
+      await db`UPDATE users SET role='operator',disabled=false WHERE email=${email}`;
+      expect(
+        (await app.inject({ url: "/api/auth/me", headers })).statusCode,
+      ).toBe(401);
+    }
+  });
+  it("OTP expiry and five-attempt lockout cannot be bypassed by changing source IP", async () => {
+    for (const expired of [false, true]) {
+      const secret = "b".repeat(32);
+      const code = "123456";
+      const [c] =
+        await db`INSERT INTO auth_challenges(email,code_hash,expires_at) VALUES(${expired ? "expired@test.local" : "locked@test.local"},${hash(secret + code)},now()+(${expired ? "-1 minute" : "5 minutes"})::interval) RETURNING id`;
+      if (!expired)
+        for (let i = 0; i < 5; i++)
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: "/api/auth/verify",
+                remoteAddress: `127.0.2.${i + 1}`,
+                payload: {
+                  challengeId: c.id,
+                  challenge: secret,
+                  code: "000000",
+                },
+              })
+            ).statusCode,
+          ).toBe(401);
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/auth/verify",
+            remoteAddress: "127.0.2.20",
+            payload: { challengeId: c.id, challenge: secret, code },
+          })
+        ).statusCode,
+      ).toBe(401);
+    }
+  });
+  it("administrator OTP requires MFA and a TOTP counter cannot be replayed", async () => {
+    process.env.ADMIN_MFA_SECRET = "JBSWY3DPEHPK3PXP";
+    const email = "mfa-regression@test.local";
+    await session("admin", email);
+    const secret = "c".repeat(32),
+      code = "123456";
+    async function challenge() {
+      return (
+        await db`INSERT INTO auth_challenges(email,code_hash,expires_at) VALUES(${email},${hash(secret + code)},now()+interval '5 minutes') RETURNING id`
+      )[0].id as string;
+    }
+    const c = await challenge();
+    const payload = { challengeId: c, challenge: secret, code };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/verify",
+          remoteAddress: "127.0.3.1",
+          payload,
+        })
+      ).statusCode,
+    ).toBe(401);
+    const mfa = new TOTP({
+      secret: Secret.fromBase32(process.env.ADMIN_MFA_SECRET),
+    }).generate();
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/verify",
+          remoteAddress: "127.0.3.2",
+          payload: { ...payload, mfa },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/verify",
+          remoteAddress: "127.0.3.3",
+          payload: { ...payload, challengeId: await challenge(), mfa },
+        })
+      ).statusCode,
+    ).toBe(401);
+  });
+
+  it("expired sessions cannot be reused", async () => {
+    const email = "session-expiry@test.local";
+    const headers = await session("customer", email);
+    await db`UPDATE sessions SET expires_at=now()-interval '1 second' WHERE user_id=(SELECT id FROM users WHERE email=${email})`;
+    expect(
+      (await app.inject({ url: "/api/auth/me", headers })).statusCode,
+    ).toBe(401);
+  });
+  it("retries persisted intents in their snapshotted account and blocks expired unbound attempts", async () => {
+    const key = crypto.randomUUID();
+    const request = {
+      method: "POST" as const,
+      url: "/api/orders",
+      headers: { "idempotency-key": key, "x-order-token": tracking },
+      payload: {
+        partnerId: p1,
+        items: [{ productId: p1.slice(0, -1) + "3", quantity: 1 }],
+        customerName: "Payment Retry",
+        customerEmail: "retry@test.local",
+        fulfilment: "collection",
+        paymentMethod: "card",
+      },
+    };
+    const res = await app.inject(request);
+    expect(res.statusCode).toBe(201);
+    const order: string = res.json().id;
+    await db`UPDATE partners SET stripe_account='acct_changed' WHERE id=${p1}`;
+    try {
+      expect((await app.inject(request)).statusCode).toBe(201);
+      expect(intentProvider.mock.lastCall?.slice(1)).toEqual([
+        "acct_fixture",
+        "pi_" + order,
+      ]);
+    } finally {
+      await db`UPDATE partners SET stripe_account='acct_fixture' WHERE id=${p1}`;
+    }
+    await db`UPDATE payments SET provider_id=NULL,updated_at=now()-interval '25 hours' WHERE order_id=${order}`;
+    const calls = intentProvider.mock.calls.length;
+    expect((await app.inject(request)).statusCode).toBe(409);
+    expect(intentProvider.mock.calls.length).toBe(calls);
+  });
+  it("partial refunds reverse the original VAT exactly and invoices preserve tax snapshots", async () => {
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/admin/partners/${p1}/pricing`,
+          headers: admin,
+          payload: {
+            fixedFee: 100,
+            serviceFee: 100,
+            vatBasisPoints: 2000,
+            taxConfirmed: true,
+          },
+        })
+      ).statusCode,
+    ).toBe(200);
+    const order = await capturedCard();
+    for (let i = 0; i < 3; i++)
+      expect((await app.inject(refundRequest(order, 350))).statusCode).toBe(
+        200,
+      );
+    const ledger =
+      await db`SELECT amount,vat_amount FROM ledger_entries WHERE order_id=${order} ORDER BY created_at,id`;
+    expect(ledger.reduce((sum, l) => sum + l.amount, 0)).toBe(0);
+    expect(ledger.reduce((sum, l) => sum + l.vat_amount, 0)).toBe(0);
+    const credits =
+      await db`SELECT amount,vat_amount FROM ledger_entries WHERE order_id=${order} AND kind='fee_credit' ORDER BY created_at`;
+    expect(credits.map((l) => l.vat_amount)).toEqual([-7, -6, -7]);
+    // Emulate pre-upgrade NULL-tax history without modifying immutable rows.
+    const legacy = await capturedCard(false);
+    await db`INSERT INTO ledger_entries(partner_id,order_id,reference,kind,amount,vat_basis_points,tax_confirmed) VALUES(${p1},${legacy},${legacy + ":partner_fee"},'partner_fee',100,2000,true)`;
+    for (const state of ["accepted", "preparing", "ready", "completed"])
+      expect((await transition(legacy, state)).statusCode).toBe(200);
+    for (const amount of [33, 34]) {
+      const [old] =
+        await db`INSERT INTO refunds(order_id,request_key,amount,provider_id,status) VALUES(${legacy},${crypto.randomUUID()},350,${"re_legacy_" + crypto.randomUUID()},'succeeded') RETURNING id`;
+      await db`INSERT INTO ledger_entries(partner_id,order_id,reference,kind,amount,vat_basis_points,tax_confirmed) VALUES(${p1},${legacy},${old.id + ":partner_fee"},'fee_credit',${-amount},2000,true)`;
+    }
+    await db`UPDATE orders SET refunded_amount=700,payment_state='partially_refunded' WHERE id=${legacy}`;
+    await db`UPDATE payments SET state='partially_refunded' WHERE order_id=${legacy}`;
+    expect((await app.inject(refundRequest(legacy, 350))).statusCode).toBe(200);
+    const [rounding] =
+      await db`SELECT vat_amount FROM ledger_entries WHERE order_id=${legacy} AND vat_amount IS NOT NULL`;
+    expect(rounding.vat_amount).toBe(-6);
+    expect(
+      (
+        await db`SELECT * FROM ledger_entries WHERE order_id=${legacy} AND vat_amount IS NULL`
+      ).length,
+    ).toBe(3);
+    const nextWeek = new Date(new Date(weekStart()).getTime() + 7 * 86400000)
+      .toISOString()
+      .slice(0, 10);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(new Date(nextWeek).getTime() + 8 * 86400000));
+    try {
+      const result = await app.inject({
+        method: "POST",
+        url: "/api/admin/invoices",
+        headers: admin,
+        payload: { partnerId: p1, periodStart: nextWeek },
+      });
+      expect(result.statusCode).toBe(200);
+      const [sum] =
+        await db`SELECT sum(il.net)::int AS net,sum(il.vat)::int AS vat,count(*)::int AS count FROM invoice_lines il JOIN ledger_entries l ON l.id=il.ledger_id WHERE il.invoice_id=${result.json().id} AND l.order_id IN (${order},${legacy})`;
+      expect(sum).toMatchObject({ net: 0, vat: 0, count: 8 });
     } finally {
       vi.useRealTimers();
     }
