@@ -74,3 +74,20 @@ See [development results](docs/development-progress.md), [requirements coverage]
 Review follow-up: [PR #1 stabilisation report](docs/stabilization-review.md). Access-change migrations revoke existing sessions once; run migrations before starting the updated API.
 
 Current follow-up: [payment/security/isolation report](docs/payment-security-review.md). Backend production-semantics image build and restricted-login smoke instructions are in [deployment](docs/deployment.md); no deployment is authorised.
+
+## Reconciliation and staging preparation
+
+Finance administrators now have a reconciliation workspace for Dashboard refunds, disputes, settlements, payout paging and guarded provider refresh/recovery. Access governors manage explicit operations/finance/support/governance grants, account disabling and memberships with fresh MFA and audit. See [financial reconciliation](docs/financial-reconciliation.md) and [current delivery report](docs/reconciliation-staging-review.md).
+
+`pnpm stripe:verify` is read-only and exits 2 when private test credentials are absent. Follow the [precise test-mode procedure](docs/stripe-test-procedure.md); this delivery performed no real Stripe operations. `pnpm admin:rotate-key` is an explicit privileged keyring-maintenance command, never a scheduled action.
+
+The [staging runbook](docs/staging-runbook.md) and Compose/Caddy/Prometheus templates are preparation only. No VPS was contacted or deployed. Additional checks:
+
+```bash
+pnpm build:backend
+pnpm test:restore       # dedicated loopback *_test DB only; private disposable dump/restore
+pnpm test:staging-config # syntax validation containers only, no staging stack startup
+pnpm test:web-image    # requires locally built north-web:ci, uses loopback 3108
+```
+
+Run migrations before restarting the updated API; legacy administrators are signed out once and retain their previous full permissions through an explicit migration backfill. Newly created admins require explicit grants and individual MFA enrollment. Reapply runtime-role SQL after migrations. All application release images exclude mobile/test/compiler dependencies; the separate compiled migrator alone contains SQL and receives the schema-owner credential. No runtime audit replaces the still-required, currently failing whole-repository audit.

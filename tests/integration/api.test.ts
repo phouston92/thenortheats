@@ -1,6 +1,25 @@
+import { StripeProvider } from "../../packages/payments/src/index";
+import { intentResponse } from "../fixtures/stripe";
+import { dependencyHealth } from "../../apps/api/src/operations";
+import {
+  financialEvent,
+  recordFinancialEvent,
+  replayFinancialEvents,
+  snapshotEvent,
+} from "../../apps/api/src/reconciliation";
+import { rotateMfaKey } from "../../scripts/rotate-mfa-key";
+import { decryptMfa } from "../../apps/api/src/mfa";
 import { validateRuntimeDatabase } from "../../packages/database/src/runtime-security";
 import { compensateOrder } from "../../apps/api/src/compensation";
-import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
+import {
+  beforeAll,
+  beforeEach,
+  afterAll,
+  describe,
+  it,
+  expect,
+  vi,
+} from "vitest";
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { connect } from "../../packages/database/src/index";
@@ -44,9 +63,17 @@ const app = await createApp(db, {
 const p1 = "10000000-0000-4000-8000-000000000001",
   p2 = "10000000-0000-4000-8000-000000000002";
 let owner: any, operator: any, admin: any;
+let scenario = 0,
+  scenarioIp = "127.11.0.1";
+beforeEach(() => {
+  scenarioIp = "127.11.0." + ++scenario;
+});
 async function session(role: string, email: string, p?: string) {
   const [u] =
     await db`INSERT INTO users(email,role) VALUES(${email},${role}) ON CONFLICT(email) DO UPDATE SET role=EXCLUDED.role RETURNING id`;
+  if (role === "admin")
+    for (const permission of ["operations", "finance", "support", "governance"])
+      await db`INSERT INTO admin_permissions VALUES(${u.id},${permission}) ON CONFLICT DO NOTHING`;
   if (p)
     await db`INSERT INTO memberships VALUES(${u.id},${p}) ON CONFLICT DO NOTHING`;
   const token = randomBytes(32).toString("hex");
@@ -57,7 +84,7 @@ async function session(role: string, email: string, p?: string) {
 beforeAll(async () => {
   await migrate(db);
   await migrate(db);
-  await db`TRUNCATE towns,users,webhook_events,auth_rate_limits CASCADE`;
+  await db`TRUNCATE towns,users,webhook_events,auth_rate_limits,provider_events CASCADE`;
   await seed(db);
   await seed(db);
   admin = await session("admin", "admin@test.local");
@@ -230,6 +257,7 @@ describe("phase 3 order and billing scenarios", () => {
     return app.inject({
       method: "POST",
       url: "/api/orders",
+      remoteAddress: scenarioIp,
       headers: {
         "idempotency-key": crypto.randomUUID(),
         "x-order-token": tracking,
@@ -249,6 +277,7 @@ describe("phase 3 order and billing scenarios", () => {
     return app.inject({
       method: "POST",
       url: `/api/partner/${p1}/orders/${order}/transition`,
+      remoteAddress: scenarioIp,
       headers: owner,
       payload: { status, reason },
     });
@@ -287,6 +316,7 @@ describe("phase 3 order and billing scenarios", () => {
     return app.inject({
       method: "POST",
       url: "/api/webhooks/stripe",
+      remoteAddress: scenarioIp,
       headers: {
         "content-type": "application/json",
         "stripe-signature": signature,
@@ -307,6 +337,7 @@ describe("phase 3 order and billing scenarios", () => {
     const options = {
       method: "POST" as const,
       url: "/api/orders",
+      remoteAddress: scenarioIp,
       headers: { "idempotency-key": key, "x-order-token": tracking },
       payload,
     };
@@ -528,6 +559,7 @@ describe("phase 3 order and billing scenarios", () => {
       account?: string;
       eventId?: ReturnType<typeof crypto.randomUUID>;
       live?: boolean;
+      created?: number;
     } = {},
   ) {
     process.env.STRIPE_SECRET_KEY = "sk_test_fixture_not_a_credential";
@@ -539,6 +571,7 @@ describe("phase 3 order and billing scenarios", () => {
       type,
       account: options.account ?? "acct_fixture",
       livemode: options.live ?? false,
+      created: options.created ?? Math.floor(Date.now() / 1000),
       data: { object },
     });
     const signature = Stripe.webhooks.generateTestHeaderString({
@@ -548,6 +581,7 @@ describe("phase 3 order and billing scenarios", () => {
     return app.inject({
       method: "POST",
       url: "/api/webhooks/stripe",
+      remoteAddress: scenarioIp,
       headers: {
         "content-type": "application/json",
         "stripe-signature": signature,
@@ -576,6 +610,7 @@ describe("phase 3 order and billing scenarios", () => {
     return {
       method: "POST" as const,
       url: `/api/admin/orders/${orderId}/refund`,
+      remoteAddress: scenarioIp,
       headers: admin,
       payload: { amount, requestKey: key, refundServiceFee },
     };
@@ -885,6 +920,7 @@ describe("phase 3 order and billing scenarios", () => {
     const request = {
       method: "POST" as const,
       url: "/api/orders",
+      remoteAddress: scenarioIp,
       headers: {
         ...first,
         "idempotency-key": crypto.randomUUID(),
@@ -1035,6 +1071,7 @@ describe("phase 3 order and billing scenarios", () => {
     const request = {
       method: "POST" as const,
       url: "/api/orders",
+      remoteAddress: scenarioIp,
       headers: { "idempotency-key": key, "x-order-token": tracking },
       payload: {
         partnerId: p1,
@@ -1426,6 +1463,1138 @@ describe("phase 3 order and billing scenarios", () => {
           await tx.unsafe(statement);
         }),
       ).rejects.toMatchObject({ code: "42501" });
+    }
+  });
+  it("adopts Dashboard refunds exactly once and never invoices the online service fee", async () => {
+    const order = await capturedCard(),
+      object = {
+        id: "re_dashboard_" + crypto.randomUUID(),
+        payment_intent: "pi_" + order,
+        amount: 350,
+        currency: "gbp",
+        status: "succeeded",
+      },
+      eventId = crypto.randomUUID();
+    expect(
+      (await signedEvent("refund.created", object, { eventId })).statusCode,
+    ).toBe(200);
+    expect(
+      (await signedEvent("refund.created", object, { eventId })).json()
+        .duplicate,
+    ).toBe(true);
+    expect((await signedEvent("refund.updated", object)).statusCode).toBe(200);
+    expect(
+      (
+        await db`SELECT amount,origin,status FROM refunds WHERE order_id=${order}`
+      )[0],
+    ).toMatchObject({ amount: 350, origin: "dashboard", status: "succeeded" });
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(350);
+    expect(
+      (
+        await db`SELECT * FROM ledger_entries WHERE order_id=${order} AND kind='fee_credit'`
+      ).length,
+    ).toBe(1);
+    expect(
+      (
+        await db`SELECT * FROM ledger_entries WHERE order_id=${order} AND kind='cash_service_fee'`
+      ).length,
+    ).toBe(0);
+  });
+  it("replays an external refund arriving before its capture without inventing payment success", async () => {
+    const res = await checkout("card"),
+      order = res.json().id;
+    const eventId = crypto.randomUUID(),
+      object = {
+        id: "re_early_" + order,
+        payment_intent: "pi_" + order,
+        amount: 200,
+        currency: "gbp",
+        status: "succeeded",
+      };
+    expect(
+      (await signedEvent("refund.updated", object, { eventId })).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await db`SELECT state,last_error FROM reconciliation_jobs WHERE event_id=${eventId}`
+      )[0],
+    ).toMatchObject({ state: "pending", last_error: "capture_not_reconciled" });
+    expect(
+      (await db`SELECT * FROM refunds WHERE order_id=${order}`).length,
+    ).toBe(0);
+    await webhook(order, "payment_intent.succeeded");
+    await replayFinancialEvents(db, eventId);
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(200);
+    expect(
+      (
+        await db`SELECT state FROM reconciliation_jobs WHERE event_id=${eventId}`
+      )[0].state,
+    ).toBe("processed");
+  });
+  it("quarantines unmatched/oversized external refunds and rejects foreign currency", async () => {
+    const order = await capturedCard(false),
+      [o] = await db`SELECT total FROM orders WHERE id=${order}`;
+    const object = {
+        id: "re_invalid_" + order,
+        payment_intent: "pi_" + order,
+        amount: o.total + 1,
+        currency: "gbp",
+        status: "succeeded",
+      },
+      eventId = crypto.randomUUID();
+    expect(
+      (await signedEvent("refund.updated", object, { eventId })).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await db`SELECT state FROM reconciliation_jobs WHERE event_id=${eventId}`
+      )[0].state,
+    ).toBe("blocked");
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(0);
+    expect(
+      (
+        await signedEvent("refund.updated", {
+          ...object,
+          amount: 1,
+          currency: "usd",
+        })
+      ).statusCode,
+    ).toBe(409);
+    const unknown = crypto.randomUUID();
+    await signedEvent(
+      "refund.created",
+      { ...object, id: "re_unknown", amount: 1, payment_intent: "pi_unknown" },
+      { eventId: unknown },
+    );
+    expect(
+      (
+        await db`SELECT last_error FROM reconciliation_jobs WHERE event_id=${unknown}`
+      )[0].last_error,
+    ).toBe("unknown_payment");
+  });
+  it("reconciles failed/pending Dashboard refunds without credits and ignores a stale failure after success", async () => {
+    const order = await capturedCard(),
+      object = {
+        id: "re_pending_ext_" + order,
+        payment_intent: "pi_" + order,
+        amount: 100,
+        currency: "gbp",
+        status: "pending",
+      };
+    await signedEvent("refund.created", object);
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(0);
+    await signedEvent("refund.updated", { ...object, status: "succeeded" });
+    await signedEvent("refund.failed", { ...object, status: "failed" });
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(100);
+  });
+  it("records dispute debit/reversal once despite duplicates and out-of-order events", async () => {
+    const order = await capturedCard(),
+      charge = "ch_" + order;
+    await db`UPDATE payments SET charge_id=${charge} WHERE order_id=${order}`;
+    const object = {
+      id: "dp_" + order,
+      charge,
+      amount: 400,
+      currency: "gbp",
+      status: "needs_response",
+      reason: "fraudulent",
+      evidence_details: { due_by: 2000000000 },
+    };
+    await signedEvent("charge.dispute.created", object, { created: 100 });
+    expect((await app.inject(refundRequest(order, 100))).statusCode).toBe(409);
+    await signedEvent(
+      "charge.dispute.closed",
+      { ...object, status: "won" },
+      { created: 200 },
+    );
+    await signedEvent("charge.dispute.created", object, { created: 50 });
+    await signedEvent(
+      "charge.dispute.closed",
+      { ...object, status: "won" },
+      { created: 200 },
+    );
+    const [sum] =
+      await db`SELECT sum(amount)::int AS amount,count(*)::int AS count FROM financial_adjustments WHERE order_id=${order}`;
+    expect(sum).toMatchObject({ amount: 0, count: 2 });
+    expect(
+      (
+        await db`SELECT status FROM provider_disputes WHERE provider_id=${object.id}`
+      )[0].status,
+    ).toBe("won");
+    expect(
+      (
+        await db`SELECT sum(amount)::int AS amount FROM ledger_entries WHERE order_id=${order}`
+      )[0].amount,
+    ).toBe(100);
+  });
+  it("handles dispute close-before-create, and lost chargebacks block refund compensation", async () => {
+    const order = await capturedCard(false),
+      charge = "ch_closed_" + order;
+    await db`UPDATE payments SET charge_id=${charge} WHERE order_id=${order}`;
+    const object = {
+      id: "dp_close_" + order,
+      charge,
+      amount: 200,
+      currency: "gbp",
+      status: "won",
+      reason: "fraudulent",
+      evidence_details: { due_by: null },
+    };
+    await signedEvent("charge.dispute.closed", object, { created: 200 });
+    await signedEvent(
+      "charge.dispute.created",
+      { ...object, status: "needs_response" },
+      { created: 100 },
+    );
+    expect(
+      (
+        await db`SELECT count(*)::int AS count,sum(amount)::int AS amount FROM financial_adjustments WHERE order_id=${order}`
+      )[0],
+    ).toMatchObject({ count: 2, amount: 0 });
+    const lost = { ...object, id: "dp_lost_" + order, status: "lost" };
+    await signedEvent("charge.dispute.closed", lost, { created: 300 });
+    await transition(order, "cancelled", "Chargeback investigation");
+    await compensateOrder(
+      db,
+      {
+        intent: intentProvider,
+        refund: refundProvider,
+        capture: captureProvider,
+      },
+      order,
+    );
+    expect(
+      (
+        await db`SELECT state,last_error FROM payment_compensations WHERE order_id=${order}`
+      )[0],
+    ).toMatchObject({
+      state: "blocked",
+      last_error: "dispute_requires_reconciliation",
+    });
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(0);
+  });
+  it("retains immutable settlement entries, validates net amounts and allocates only automatic payouts", async () => {
+    const payout = {
+      id: "po_settlement",
+      amount: 800,
+      currency: "gbp",
+      status: "paid",
+      automatic: true,
+      arrival_date: 2000000000,
+      balance_transaction: "txn_payout",
+      failure_code: null,
+    };
+    await signedEvent("payout.paid", payout, { created: 200 });
+    const balance = {
+      id: "txn_settlement",
+      amount: 1000,
+      fee: 200,
+      net: 800,
+      currency: "gbp",
+      source: "ch_settlement",
+      reporting_category: "charge",
+      status: "available",
+      fee_details: [
+        { type: "stripe_fee", amount: 100, currency: "gbp" },
+        { type: "application_fee", amount: 100, currency: "gbp" },
+      ],
+      available_on: 1900000000,
+      payout_id: payout.id,
+    };
+    for (let i = 0; i < 2; i++)
+      await db.begin((tx) =>
+        recordFinancialEvent(
+          tx,
+          snapshotEvent(
+            "acct_fixture",
+            "balance_transaction.snapshot",
+            balance,
+          ),
+        ),
+      );
+    expect(
+      (
+        await db`SELECT * FROM provider_balances WHERE provider_id=${balance.id}`
+      ).length,
+    ).toBe(1);
+    expect(
+      (
+        await db`SELECT * FROM payout_balance_links WHERE payout_id=${payout.id}`
+      ).length,
+    ).toBe(1);
+    await expect(
+      db.begin((tx) =>
+        recordFinancialEvent(
+          tx,
+          snapshotEvent("acct_fixture", "balance_transaction.snapshot", {
+            ...balance,
+            net: 801,
+          }),
+        ),
+      ),
+    ).rejects.toThrow("Balance net mismatch");
+    await expect(
+      db`UPDATE provider_balances SET net=0 WHERE provider_id=${balance.id}`,
+    ).rejects.toThrow("immutable");
+    await expect(db`DELETE FROM financial_adjustments`).rejects.toThrow(
+      "immutable",
+    );
+  });
+  it("uses payout event chronology and quarantines same-second status conflicts", async () => {
+    const object = {
+      id: "po_ordered",
+      amount: 500,
+      currency: "gbp",
+      status: "paid",
+      automatic: true,
+      arrival_date: 2000000000,
+      balance_transaction: "txn_ordered",
+      failure_code: null,
+    };
+    await signedEvent("payout.paid", object, { created: 200 });
+    await signedEvent(
+      "payout.created",
+      { ...object, status: "pending" },
+      { created: 100 },
+    );
+    expect(
+      (
+        await db`SELECT status FROM provider_payouts WHERE provider_id=${object.id}`
+      )[0].status,
+    ).toBe("paid");
+    const conflict = crypto.randomUUID();
+    await signedEvent(
+      "payout.failed",
+      { ...object, status: "failed", failure_code: "account_closed" },
+      { created: 200, eventId: conflict },
+    );
+    expect(
+      (
+        await db`SELECT state FROM reconciliation_jobs WHERE event_id=${conflict}`
+      )[0].state,
+    ).toBe("blocked");
+    await signedEvent(
+      "payout.failed",
+      { ...object, status: "failed", failure_code: "account_closed" },
+      { created: 300 },
+    );
+    expect(
+      (
+        await db`SELECT status FROM provider_payouts WHERE provider_id=${object.id}`
+      )[0].status,
+    ).toBe("failed");
+  });
+  it("records observed application-fee refunds without another invoice credit", async () => {
+    const order = await capturedCard(),
+      charge = "ch_fee_" + order;
+    await db`UPDATE payments SET charge_id=${charge} WHERE order_id=${order}`;
+    const o = {
+      id: "fee_" + order,
+      account: "acct_fixture",
+      charge,
+      amount: 100,
+      amount_refunded: 40,
+      currency: "gbp",
+    };
+    await signedEvent("application_fee.refunded", o);
+    await signedEvent("application_fee.created", { ...o, amount_refunded: 0 });
+    expect(
+      (
+        await db`SELECT amount_refunded FROM provider_application_fees WHERE order_id=${order}`
+      )[0].amount_refunded,
+    ).toBe(40);
+    expect(
+      (await db`SELECT * FROM ledger_entries WHERE order_id=${order}`).length,
+    ).toBe(1);
+    expect(
+      (
+        await signedEvent("application_fee.created", {
+          ...o,
+          id: "fee_bad_" + order,
+          amount: 101,
+        })
+      ).statusCode,
+    ).toBe(409);
+  });
+  it("strips client secrets and personal data from provider evidence", async () => {
+    const event = financialEvent({
+      id: "evt_safe",
+      account: "acct_fixture",
+      type: "refund.created",
+      created: 1,
+      data: {
+        object: {
+          id: "re_safe",
+          amount: 1,
+          currency: "gbp",
+          status: "pending",
+          payment_intent: "pi_safe",
+          client_secret: "DO_NOT_STORE",
+          billing_details: { email: "PRIVATE_EMAIL" },
+        },
+      },
+    })!;
+    expect(JSON.stringify(event)).not.toContain("DO_NOT_STORE");
+    expect(JSON.stringify(event)).not.toContain("PRIVATE_EMAIL");
+  });
+  it("enforces finance/governance scopes and revokes sessions after permission changes", async () => {
+    const headers = await session("admin", "scoped-admin@test.local");
+    const [u] =
+      await db`SELECT id FROM users WHERE email='scoped-admin@test.local'`;
+    await db`DELETE FROM admin_permissions WHERE user_id=${u.id} AND permission<>'finance'`;
+    expect(
+      (await app.inject({ url: "/api/admin/reconciliation", headers }))
+        .statusCode,
+    ).toBe(401);
+    const token = randomBytes(32).toString("hex"),
+      csrf = randomBytes(24).toString("hex");
+    await db`INSERT INTO sessions VALUES(${hash(token)},${u.id},${csrf},now()+interval '1 hour',now())`;
+    const limited = { cookie: "north_session=" + token, "x-csrf-token": csrf };
+    expect(
+      (await app.inject({ url: "/api/admin/reconciliation", headers: limited }))
+        .statusCode,
+    ).toBe(200);
+    expect(
+      (await app.inject({ url: "/api/admin/access/users", headers: limited }))
+        .statusCode,
+    ).toBe(403);
+    expect(
+      (await app.inject({ url: "/api/admin/partners", headers: limited }))
+        .statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          url: "/api/partner/" + p2 + "/reconciliation",
+          headers: owner,
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          url: "/api/admin/reconciliation",
+          headers: operator,
+        })
+      ).statusCode,
+    ).toBe(403);
+  });
+  it("database constraints reject cross-tenant ledger, order item and invoice associations", async () => {
+    const order = await capturedCard(),
+      [o] = await db`SELECT id FROM orders WHERE id=${order}`;
+    await expect(
+      db`INSERT INTO ledger_entries(partner_id,order_id,reference,kind,amount,vat_basis_points) VALUES(${p2},${o.id},${"cross:" + order},'adjustment',1,0)`,
+    ).rejects.toMatchObject({ code: "23503" });
+    await expect(
+      db`INSERT INTO order_items(order_id,product_id,name,quantity,unit_price) VALUES(${order},'10000001-0000-4000-8000-000000000003','Wrong tenant',1,10)`,
+    ).rejects.toMatchObject({ code: "23514" });
+    await expect(
+      db`UPDATE products SET partner_id=${p2} WHERE id='10000000-0000-4000-8000-000000000003'`,
+    ).rejects.toMatchObject({ code: "23514" });
+    const [invoice] =
+      await db`INSERT INTO invoices(partner_id,period_start,period_end,net,vat,total) VALUES(${p2},'2020-01-06','2020-01-13',1,0,1) RETURNING id`;
+    const [ledger] =
+      await db`SELECT id FROM ledger_entries WHERE order_id=${order} LIMIT 1`;
+    await expect(
+      db`INSERT INTO invoice_lines(invoice_id,ledger_id,description,net,vat) VALUES(${invoice.id},${ledger.id},'Cross tenant',1,0)`,
+    ).rejects.toMatchObject({ code: "23514" });
+  });
+  it("requires fresh MFA for access governance, audits grants and revokes target sessions", async () => {
+    const governor = await session("admin", "governor@test.local"),
+      [g] = await db`SELECT id FROM users WHERE email='governor@test.local'`;
+    const secret = "JBSWY3DPEHPK3PXP";
+    await db`INSERT INTO admin_mfa VALUES(${g.id},${encryptMfa(secret, g.id)},now())`;
+    const target = await session("customer", "governance-target@test.local");
+    const payload = {
+      email: "governance-target@test.local",
+      role: "admin",
+      disabled: false,
+      permissions: ["finance"],
+      partners: [],
+      reason: "Grant reviewed financial operations access",
+      mfa: "000000",
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/admin/access/users",
+          headers: governor,
+          payload,
+        })
+      ).statusCode,
+    ).toBe(401);
+    payload.mfa = new TOTP({ secret: Secret.fromBase32(secret) }).generate();
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/admin/access/users",
+          headers: governor,
+          payload,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (await app.inject({ url: "/api/auth/me", headers: target })).statusCode,
+    ).toBe(401);
+    const [u] = await db`SELECT id FROM users WHERE email=${payload.email}`;
+    expect(
+      (
+        await db`SELECT permission FROM admin_permissions WHERE user_id=${u.id}`
+      ).map((p) => p.permission),
+    ).toEqual(["finance"]);
+    expect(
+      (
+        await db`SELECT action FROM audit_logs WHERE action='access.changed' AND subject LIKE ${"%" + u.id + "%"}`
+      ).length,
+    ).toBe(1);
+  });
+  it("cannot remove the last active governance administrator", async () => {
+    const governor = await session("admin", "last-governor@test.local"),
+      [g] =
+        await db`SELECT id FROM users WHERE email='last-governor@test.local'`;
+    const secret = "JBSWY3DPEHPK3PXP";
+    await db`INSERT INTO admin_mfa VALUES(${g.id},${encryptMfa(secret, g.id)},now())`;
+    const others =
+      await db`DELETE FROM admin_permissions WHERE permission='governance' AND user_id<>${g.id} RETURNING user_id`;
+    try {
+      const result = await app.inject({
+        method: "POST",
+        url: "/api/admin/access/users",
+        headers: governor,
+        payload: {
+          email: "last-governor@test.local",
+          role: "admin",
+          disabled: true,
+          permissions: [],
+          partners: [],
+          reason: "Attempt to disable the final access governor",
+          mfa: new TOTP({ secret: Secret.fromBase32(secret) }).generate(),
+        },
+      });
+      expect(result.statusCode).toBe(409);
+      expect(result.json().error).toContain("last active");
+    } finally {
+      for (const row of others)
+        await db`INSERT INTO admin_permissions VALUES(${row.user_id},'governance') ON CONFLICT DO NOTHING`;
+    }
+  });
+  it("requires current provider evidence before any new refund/capture recovery key", async () => {
+    const headers = await session("admin", "recovery-review@test.local"),
+      [u] =
+        await db`SELECT id FROM users WHERE email='recovery-review@test.local'`;
+    const secret = "JBSWY3DPEHPK3PXP";
+    await db`INSERT INTO admin_mfa VALUES(${u.id},${encryptMfa(secret, u.id)},now())`;
+    const order = await capturedCard(false);
+    await transition(order, "cancelled", "Financial recovery test");
+    const result = await app.inject({
+      method: "POST",
+      url: `/api/admin/reconciliation/orders/${order}/recover`,
+      headers,
+      payload: {
+        action: "resume_compensation",
+        reason: "Review ambiguous cancellation payment status",
+        mfa: new TOTP({ secret: Secret.fromBase32(secret) }).generate(),
+      },
+    });
+    expect(result.statusCode).toBe(409);
+    expect(result.json().error).toContain("fresh provider read");
+    expect(
+      (
+        await db`SELECT state FROM payment_compensations WHERE order_id=${order}`
+      )[0].state,
+    ).toBe("pending");
+  });
+  it("readiness checks Redis and private monitoring requires a separate credential", async () => {
+    const d = await dependencyHealth(db, "redis://127.0.0.1:1");
+    expect(d.database).toBe(true);
+    expect(d.redis).toBe(false);
+    process.env.MONITORING_TOKEN = "test-monitoring-token-".repeat(3);
+    try {
+      expect((await app.inject("/internal/metrics")).statusCode).toBe(401);
+      const r = await app.inject({
+        url: "/internal/metrics",
+        headers: { authorization: "Bearer " + process.env.MONITORING_TOKEN },
+      });
+      expect(r.statusCode).toBe(200);
+      expect(r.body).toContain("north_database_up 1");
+      expect(r.body).toContain("north_redis_up 1");
+      expect(r.body).not.toContain("north_dev_only");
+    } finally {
+      delete process.env.MONITORING_TOKEN;
+    }
+  });
+  it("production origin checks reject cross-site authentication and sensitive writes", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("PUBLIC_ORIGIN", "https://customer.example.test");
+    try {
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/auth/request",
+            headers: { origin: "https://evil.example.test" },
+            payload: { email: "origin@test.local" },
+          })
+        ).statusCode,
+      ).toBe(403);
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/auth/request",
+            headers: { "sec-fetch-site": "cross-site" },
+            payload: { email: "origin@test.local" },
+          })
+        ).statusCode,
+      ).toBe(403);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("read-only provider refresh validates payment identity, adopts refunds and cannot create another charge", async () => {
+    const order = await capturedCard(false),
+      [o] = await db`SELECT total FROM orders WHERE id=${order}`;
+    const headers = await session("admin", "sync-review@test.local"),
+      [u] = await db`SELECT id FROM users WHERE email='sync-review@test.local'`,
+      secret = "JBSWY3DPEHPK3PXP";
+    await db`INSERT INTO admin_mfa VALUES(${u.id},${encryptMfa(secret, u.id)},now())`;
+    const refund: Stripe.Refund = {
+      id: "re_sync_" + order,
+      object: "refund",
+      amount: 100,
+      balance_transaction: null,
+      charge: null,
+      created: 1,
+      currency: "gbp",
+      metadata: null,
+      payment_intent: "pi_" + order,
+      reason: null,
+      receipt_number: null,
+      source_transfer_reversal: null,
+      status: "succeeded",
+      transfer_reversal: null,
+    };
+    const spy = vi
+      .spyOn(StripeProvider.prototype, "reconciliationSnapshot")
+      .mockResolvedValue({
+        intent: intentResponse({
+          id: "pi_" + order,
+          amount: o.total,
+          amount_received: o.total,
+          metadata: { orderId: order },
+          status: "succeeded",
+        }),
+        charge: null,
+        refunds: [refund],
+        disputes: [],
+      });
+    try {
+      const r = await app.inject({
+        method: "POST",
+        url: `/api/admin/reconciliation/orders/${order}/sync`,
+        headers,
+        payload: {
+          reason: "Verify interrupted provider refund response",
+          mfa: new TOTP({ secret: Secret.fromBase32(secret) }).generate(),
+        },
+      });
+      expect(r.statusCode).toBe(200);
+      expect(spy).toHaveBeenCalledWith("acct_fixture", "pi_" + order);
+      expect(
+        (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+          .refunded_amount,
+      ).toBe(100);
+      expect(
+        (await db`SELECT * FROM provider_order_checks WHERE order_id=${order}`)
+          .length,
+      ).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+  it("recovery only rotates a failed refund key after complete fresh provider evidence", async () => {
+    const order = await capturedCard(false),
+      [o] = await db`SELECT total FROM orders WHERE id=${order}`;
+    await transition(order, "cancelled", "Recovery verification");
+    const failed = vi
+      .fn<PaymentProvider["refund"]>()
+      .mockResolvedValue({ id: "re_recovery_" + order, status: "failed" });
+    await compensateOrder(
+      db,
+      { intent: intentProvider, capture: captureProvider, refund: failed },
+      order,
+    );
+    await compensateOrder(
+      db,
+      { intent: intentProvider, capture: captureProvider, refund: failed },
+      order,
+    );
+    const headers = await session("admin", "verified-recovery@test.local"),
+      [u] =
+        await db`SELECT id FROM users WHERE email='verified-recovery@test.local'`,
+      secret = "JBSWY3DPEHPK3PXP";
+    await db`INSERT INTO admin_mfa VALUES(${u.id},${encryptMfa(secret, u.id)},now())`;
+    const refund: Stripe.Refund = {
+      id: "re_recovery_" + order,
+      object: "refund",
+      amount: o.total,
+      balance_transaction: null,
+      charge: null,
+      created: 1,
+      currency: "gbp",
+      metadata: null,
+      payment_intent: "pi_" + order,
+      reason: null,
+      receipt_number: null,
+      source_transfer_reversal: null,
+      status: "failed",
+      transfer_reversal: null,
+    };
+    const spy = vi
+      .spyOn(StripeProvider.prototype, "reconciliationSnapshot")
+      .mockResolvedValue({
+        intent: intentResponse({
+          id: "pi_" + order,
+          amount: o.total,
+          amount_received: o.total,
+          metadata: { orderId: order },
+          status: "succeeded",
+        }),
+        charge: null,
+        refunds: [refund],
+        disputes: [],
+      });
+    try {
+      const otp = new TOTP({ secret: Secret.fromBase32(secret) });
+      const r = await app.inject({
+        method: "POST",
+        url: `/api/admin/reconciliation/orders/${order}/sync`,
+        headers,
+        payload: {
+          reason: "Confirm the original refund is terminally failed",
+          mfa: otp.generate(),
+        },
+      });
+      expect(r.statusCode).toBe(200);
+      // A distinct accepted adjacent TOTP counter models the next authenticator step without sleeping.
+      const next = otp.generate({ timestamp: Date.now() + 30000 });
+      const oldKey = (
+        await db`SELECT request_key FROM payment_compensations WHERE order_id=${order}`
+      )[0].request_key;
+      const recovery = await app.inject({
+        method: "POST",
+        url: `/api/admin/reconciliation/orders/${order}/recover`,
+        headers,
+        payload: {
+          action: "resume_compensation",
+          reason: "Provider failure reviewed, authorise a new refund",
+          mfa: next,
+        },
+      });
+      expect(recovery.statusCode).toBe(200);
+      expect(
+        (
+          await db`SELECT state,request_key FROM payment_compensations WHERE order_id=${order}`
+        )[0],
+      ).toMatchObject({ state: "pending" });
+      expect(
+        (
+          await db`SELECT request_key FROM payment_compensations WHERE order_id=${order}`
+        )[0].request_key,
+      ).not.toBe(oldKey);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("rotates webhook secrets with a bounded overlap and rejects the expired signing key", async () => {
+    const original = process.env.STRIPE_WEBHOOK_SECRET;
+    process.env.STRIPE_WEBHOOK_SECRET = "whsec_current";
+    process.env.STRIPE_WEBHOOK_SECRET_PREVIOUS = "whsec_previous";
+    process.env.STRIPE_WEBHOOK_PREVIOUS_EXPIRES_AT = new Date(
+      Date.now() + 60000,
+    ).toISOString();
+    async function deliver(secret: string) {
+      const payload = JSON.stringify({
+        id: crypto.randomUUID(),
+        type: "payment_intent.processing",
+        account: "acct_fixture",
+        livemode: false,
+        data: { object: { id: "pi_rotation" } },
+      });
+      return app.inject({
+        method: "POST",
+        url: "/api/webhooks/stripe",
+        headers: {
+          "content-type": "application/json",
+          "stripe-signature": Stripe.webhooks.generateTestHeaderString({
+            payload,
+            secret,
+          }),
+        },
+        payload,
+      });
+    }
+    try {
+      expect((await deliver("whsec_previous")).statusCode).toBe(200);
+      process.env.STRIPE_WEBHOOK_PREVIOUS_EXPIRES_AT = new Date(
+        Date.now() - 1000,
+      ).toISOString();
+      expect((await deliver("whsec_previous")).statusCode).toBe(400);
+      expect((await deliver("whsec_current")).statusCode).toBe(200);
+    } finally {
+      process.env.STRIPE_WEBHOOK_SECRET = original;
+      delete process.env.STRIPE_WEBHOOK_SECRET_PREVIOUS;
+      delete process.env.STRIPE_WEBHOOK_PREVIOUS_EXPIRES_AT;
+    }
+  });
+  it("requires processed matching provider evidence to acknowledge a quarantined event", async () => {
+    const object = {
+      id: "po_evidence",
+      amount: 500,
+      currency: "gbp",
+      status: "paid",
+      automatic: true,
+      arrival_date: 2000000000,
+      balance_transaction: "txn_evidence",
+      failure_code: null,
+    };
+    await signedEvent("payout.paid", object, { created: 200 });
+    const eventId = crypto.randomUUID();
+    await signedEvent(
+      "payout.failed",
+      { ...object, status: "failed" },
+      { created: 200, eventId },
+    );
+    const evidence = snapshotEvent("acct_fixture", "payout.updated", {
+      ...object,
+      status: "failed",
+    });
+    await db.begin((tx) => recordFinancialEvent(tx, evidence));
+    const headers = await session("admin", "evidence-review@test.local"),
+      [u] =
+        await db`SELECT id FROM users WHERE email='evidence-review@test.local'`,
+      secret = "JBSWY3DPEHPK3PXP";
+    await db`INSERT INTO admin_mfa VALUES(${u.id},${encryptMfa(secret, u.id)},now())`;
+    const result = await app.inject({
+      method: "POST",
+      url: `/api/admin/reconciliation/events/${eventId}/acknowledge`,
+      headers,
+      payload: {
+        reason: "Authoritative provider payout state supersedes conflict",
+        evidenceId: evidence.id,
+        mfa: new TOTP({ secret: Secret.fromBase32(secret) }).generate(),
+      },
+    });
+    expect(result.statusCode).toBe(200);
+    expect(result.json().resolved_by_event).toBe(evidence.id);
+    expect(
+      (await db`SELECT * FROM provider_events WHERE event_id=${eventId}`)
+        .length,
+    ).toBe(1);
+  });
+  it("never automatically allocates manual payouts and never grants a customer administrator permissions", async () => {
+    const payout = {
+      id: "po_manual",
+      amount: 500,
+      currency: "gbp",
+      status: "paid",
+      automatic: false,
+      arrival_date: 2000000000,
+      balance_transaction: "txn_manual",
+      failure_code: null,
+    };
+    await signedEvent("payout.paid", payout);
+    const event = snapshotEvent(
+      "acct_fixture",
+      "balance_transaction.snapshot",
+      {
+        id: "txn_manual_item",
+        amount: 500,
+        fee: 0,
+        net: 500,
+        currency: "gbp",
+        source: "ch_manual",
+        reporting_category: "charge",
+        status: "available",
+        fee_details: [],
+        available_on: 1900000000,
+        payout_id: payout.id,
+      },
+    );
+    await db.begin((tx) => recordFinancialEvent(tx, event));
+    expect(
+      (
+        await db`SELECT state,last_error FROM reconciliation_jobs WHERE event_id=${event.id}`
+      )[0],
+    ).toMatchObject({
+      state: "blocked",
+      last_error: "manual_payout_cannot_be_automatically_allocated",
+    });
+    expect(
+      (
+        await db`SELECT * FROM payout_balance_links WHERE payout_id=${payout.id}`
+      ).length,
+    ).toBe(0);
+    const [u] =
+      await db`INSERT INTO users(email,role) VALUES('grant-customer@test.local','customer') RETURNING id`;
+    await expect(
+      db`INSERT INTO admin_permissions VALUES(${u.id},'finance')`,
+    ).rejects.toMatchObject({ code: "23514" });
+  });
+
+  it("provider payout refresh records complete net reconciliation without adding platform invoice fees", async () => {
+    const headers = await session("admin", "payout-review@test.local"),
+      [u] =
+        await db`SELECT id FROM users WHERE email='payout-review@test.local'`,
+      secret = "JBSWY3DPEHPK3PXP";
+    await db`INSERT INTO admin_mfa VALUES(${u.id},${encryptMfa(secret, u.id)},now())`;
+    const lastResponse = {
+      headers: {},
+      requestId: "req_fixture",
+      statusCode: 200,
+    };
+    const payout: Stripe.Response<Stripe.Payout> = {
+      id: "po_sync",
+      object: "payout",
+      amount: 800,
+      application_fee: null,
+      application_fee_amount: null,
+      arrival_date: 2000000000,
+      automatic: true,
+      balance_transaction: "txn_po_sync",
+      created: 1,
+      currency: "gbp",
+      description: null,
+      destination: null,
+      failure_balance_transaction: null,
+      failure_code: null,
+      failure_message: null,
+      livemode: false,
+      metadata: {},
+      method: "standard",
+      original_payout: null,
+      payout_method: null,
+      reconciliation_status: "completed",
+      reversed_by: null,
+      source_type: "card",
+      statement_descriptor: null,
+      status: "paid",
+      trace_id: null,
+      type: "bank_account",
+      lastResponse,
+    };
+    const balance: Stripe.BalanceTransaction = {
+      id: "txn_sync",
+      object: "balance_transaction",
+      balance_type: "payments",
+      amount: 1000,
+      available_on: 1,
+      created: 1,
+      currency: "gbp",
+      description: null,
+      exchange_rate: null,
+      fee: 200,
+      fee_details: [
+        {
+          amount: 100,
+          currency: "gbp",
+          description: null,
+          type: "stripe_fee",
+          application: null,
+        },
+        {
+          amount: 100,
+          currency: "gbp",
+          description: null,
+          type: "application_fee",
+          application: null,
+        },
+      ],
+      net: 800,
+      reporting_category: "charge",
+      source: "ch_sync",
+      status: "available",
+      type: "charge",
+    };
+    const spy = vi
+      .spyOn(StripeProvider.prototype, "payoutSnapshot")
+      .mockResolvedValue({
+        payout,
+        balances: [balance],
+        hasMore: false,
+        nextCursor: null,
+      });
+    try {
+      const before = (
+        await db`SELECT count(*)::int AS count FROM ledger_entries`
+      )[0].count;
+      const result = await app.inject({
+        method: "POST",
+        url: `/api/admin/reconciliation/partners/${p1}/payouts/po_sync/sync`,
+        headers,
+        payload: {
+          reason: "Reconcile completed automatic payout with merchant balance",
+          mfa: new TOTP({ secret: Secret.fromBase32(secret) }).generate(),
+        },
+      });
+      expect(result.statusCode).toBe(200);
+      expect(spy).toHaveBeenCalledWith("acct_fixture", "po_sync", undefined);
+      expect(
+        (
+          await db`SELECT complete,net_matches FROM payout_reconciliation WHERE payout_id='po_sync'`
+        )[0],
+      ).toMatchObject({ complete: true, net_matches: true });
+      expect(
+        (await db`SELECT count(*)::int AS count FROM ledger_entries`)[0].count,
+      ).toBe(before);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("settles API-requested refund failure webhooks without issuing a credit", async () => {
+    const order = await capturedCard(),
+      key = crypto.randomUUID(),
+      headers = await session("admin", "refund-failure-event@test.local");
+    refundProvider.mockResolvedValueOnce({
+      id: "re_failed_event_" + key,
+      status: "pending",
+    });
+    expect(
+      (await app.inject({ ...refundRequest(order, 100, key), headers }))
+        .statusCode,
+    ).toBe(200);
+    const object = {
+      ...refundObject(order, 100, key),
+      id: "re_failed_event_" + key,
+      status: "failed",
+    };
+    expect((await signedEvent("refund.failed", object)).statusCode).toBe(200);
+    expect(
+      (await db`SELECT status FROM refunds WHERE request_key=${key}`)[0].status,
+    ).toBe("failed");
+    expect(
+      (await db`SELECT refunded_amount FROM orders WHERE id=${order}`)[0]
+        .refunded_amount,
+    ).toBe(0);
+  });
+
+  it("tenant guards cannot be bypassed with runtime-created temporary shadow tables", async () => {
+    const order = await capturedCard(false);
+    await db.unsafe(
+      await readFile(
+        new URL(
+          "../../infrastructure/database/runtime-role.sql",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    );
+    await expect(
+      db.begin(async (tx) => {
+        await tx.unsafe("SET LOCAL ROLE north_runtime");
+        await tx.unsafe(
+          "CREATE TEMP TABLE orders(id uuid,partner_id uuid) ON COMMIT DROP; CREATE TEMP TABLE products(id uuid,partner_id uuid) ON COMMIT DROP",
+        );
+        await tx`INSERT INTO pg_temp.orders VALUES(${order},${p1})`;
+        await tx`INSERT INTO pg_temp.products VALUES('10000001-0000-4000-8000-000000000003',${p1})`;
+        await tx`INSERT INTO public.order_items(order_id,product_id,name,quantity,unit_price) VALUES(${order},'10000001-0000-4000-8000-000000000003','Shadow attack',1,1)`;
+      }),
+    ).rejects.toMatchObject({ code: "23514" });
+  });
+
+  it("failed charge attempts do not pin a payment to the wrong charge on retry", async () => {
+    const res = await checkout("card"),
+      order = res.json().id,
+      [o] = await db`SELECT total,service_fee FROM orders WHERE id=${order}`;
+    const pi = {
+      id: "pi_" + order,
+      currency: "gbp",
+      amount: o.total,
+      application_fee_amount: o.service_fee,
+      amount_received: 0,
+      metadata: { orderId: order },
+      latest_charge: "ch_failed_" + order,
+    };
+    expect(
+      (await signedEvent("payment_intent.payment_failed", pi)).statusCode,
+    ).toBe(200);
+    const failedCharge = {
+      id: pi.latest_charge,
+      payment_intent: pi.id,
+      amount: o.total,
+      amount_captured: 0,
+      currency: "gbp",
+      paid: false,
+      captured: false,
+    };
+    expect((await signedEvent("charge.updated", failedCharge)).statusCode).toBe(
+      200,
+    );
+    expect(
+      (await db`SELECT charge_id FROM payments WHERE order_id=${order}`)[0]
+        .charge_id,
+    ).toBeNull();
+    expect(
+      (
+        await signedEvent("payment_intent.succeeded", {
+          ...pi,
+          latest_charge: "ch_success_" + order,
+          amount_received: o.total,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect((await signedEvent("charge.updated", failedCharge)).statusCode).toBe(
+      200,
+    );
+    expect(
+      (
+        await db`SELECT charge_id,state FROM payments WHERE order_id=${order}`
+      )[0],
+    ).toMatchObject({ charge_id: "ch_success_" + order, state: "captured" });
+  });
+  it("rotation re-encrypts legacy MFA atomically and revokes sessions without exposing plaintext", async () => {
+    const headers = await session("admin", "key-rotation@test.local"),
+      [u] =
+        await db`SELECT id FROM users WHERE email='key-rotation@test.local'`;
+    await db`INSERT INTO admin_mfa(user_id,secret_ciphertext) VALUES(${u.id},${encryptMfa("JBSWY3DPEHPK3PXP", u.id)})`;
+    process.env.MFA_ENCRYPTION_KEYS = JSON.stringify({ next: "43".repeat(32) });
+    process.env.MFA_ACTIVE_KEY_ID = "next";
+    try {
+      expect(await rotateMfaKey(db)).toBeGreaterThan(0);
+      const [row] =
+        await db`SELECT secret_ciphertext FROM admin_mfa WHERE user_id=${u.id}`;
+      expect(row.secret_ciphertext.startsWith("v1:next:")).toBe(true);
+      expect(decryptMfa(row.secret_ciphertext, u.id)).toBe("JBSWY3DPEHPK3PXP");
+      expect(
+        (await app.inject({ url: "/api/auth/me", headers })).statusCode,
+      ).toBe(401);
+      expect(await rotateMfaKey(db)).toBe(0);
+    } finally {
+      delete process.env.MFA_ENCRYPTION_KEYS;
+      delete process.env.MFA_ACTIVE_KEY_ID;
     }
   });
 });

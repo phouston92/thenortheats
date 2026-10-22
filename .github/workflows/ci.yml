@@ -3,6 +3,7 @@ on: [push, pull_request]
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     services:
       postgres:
         image: postgres:17.7-alpine
@@ -40,9 +41,19 @@ jobs:
         env:
           EXPO_NO_TELEMETRY: 1
       - run: pnpm exec playwright install --with-deps chromium
+        timeout-minutes: 10
       - run: pnpm test:browser
       - run: pnpm build:backend && pnpm audit:backend
       - run: docker build -f infrastructure/docker/backend.Dockerfile -t north-backend:ci .
       - run: docker run --rm --entrypoint node -v "$PWD/scripts/verify-backend.mjs:/verify-backend.mjs:ro" north-backend:ci /verify-backend.mjs
       - run: pnpm test:backend-image
+      - run: docker build --target migration -f infrastructure/docker/backend.Dockerfile -t north-migrator:ci .
+      - run: docker run --rm --network=host -e DATABASE_URL -e NODE_ENV north-migrator:ci
+      - run: docker builder prune --all --force
+      - run: docker build -f infrastructure/docker/web.Dockerfile -t north-web:ci .
+      - run: docker run --rm --entrypoint node -v "$PWD/scripts/verify-web.mjs:/verify-web.mjs:ro" north-web:ci /verify-web.mjs
+      - run: pnpm test:web-image
+      - run: docker builder prune --all --force
+      - run: pnpm test:staging-config
+      - run: pnpm test:restore
       - run: pnpm audit --audit-level high

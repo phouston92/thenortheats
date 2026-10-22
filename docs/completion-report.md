@@ -1,5 +1,7 @@
 # Delivery report
 
+**Current delivery:** [Provider reconciliation and staging preparation](reconciliation-staging-review.md) supersedes earlier follow-up counts and missing-capability statements. No actual Stripe-provider operation or VPS deployment was performed.
+
 **Latest follow-up:** [Payment, security and deployment isolation review](payment-security-review.md) supersedes historical result counts and earlier unfinished MFA/onboarding/container statements below. No external provider verification or deployment is claimed.
 
 **PR #1 stabilisation follow-up:** see [stabilization-review.md](stabilization-review.md) for changed files, security exposure and regression fixes. Current local totals are **24 unit, 35 integration and 4 browser tests passing**, with **2 high and 1 moderate** unresolved advisories and no audit suppression. Exact hosted run outcomes are recorded in the updated PR description and task response. The sections below describe the original baseline delivery.

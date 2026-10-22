@@ -1,3 +1,6 @@
+import { operationsRoutes } from "./operations";
+import { governanceRoutes } from "./governance";
+import { reconciliationRoutes } from "./reconciliation-routes";
 import Fastify from "fastify";
 import { mfaRoutes } from "./mfa";
 import { authAbuseProtection } from "./abuse";
@@ -42,11 +45,28 @@ export async function createApp(
         : ["http://localhost:8081", "http://127.0.0.1:8081"],
     credentials: true,
   });
+  app.addHook("onRequest", async (req, reply) => {
+    if (
+      process.env.NODE_ENV !== "production" ||
+      ["GET", "HEAD", "OPTIONS"].includes(req.method) ||
+      req.url === "/api/webhooks/stripe"
+    )
+      return;
+    const origins = [
+      process.env.PUBLIC_ORIGIN,
+      process.env.PARTNER_PORTAL_ORIGIN,
+      process.env.ADMIN_PORTAL_ORIGIN,
+    ].filter(Boolean);
+    if (
+      (req.headers.origin && !origins.includes(req.headers.origin)) ||
+      req.headers["sec-fetch-site"] === "cross-site"
+    )
+      return reply.code(403).send({ error: "Untrusted request origin" });
+  });
   await app.register(cookie);
   authAbuseProtection(app, db);
   app.addHook("onSend", async (req, reply, payload) => {
-    if (req.url.startsWith("/api/"))
-      reply.header("cache-control", "no-store");
+    if (req.url.startsWith("/api/")) reply.header("cache-control", "no-store");
     return payload;
   });
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
@@ -82,11 +102,10 @@ export async function createApp(
     status: "ok",
     service: "The North Eats API",
   }));
-  app.get("/api/ready", async () => {
-    await db`SELECT 1`;
-    return { status: "ready" };
-  });
+  await operationsRoutes(app, db);
   await authRoutes(app, db);
+  await governanceRoutes(app, db);
+  await reconciliationRoutes(app, db);
   await mfaRoutes(app, db);
   await connectRoutes(app, db);
   app.get(
@@ -184,7 +203,7 @@ export async function createApp(
   });
   app.post("/api/admin/staff", async (req) => {
     const a = await actor(db, req);
-    admin(a);
+    admin(a, "governance");
     const v = z
       .object({
         email: z.email(),
@@ -209,7 +228,7 @@ export async function createApp(
     return db`SELECT id,email,disabled,created_at FROM users WHERE role='customer' ORDER BY created_at DESC LIMIT 200`;
   });
   app.get("/api/admin/audit", async (req) => {
-    admin(await actor(db, req));
+    admin(await actor(db, req), "governance");
     return db`SELECT l.*,u.email AS actor FROM audit_logs l LEFT JOIN users u ON u.id=l.actor_id ORDER BY l.id DESC LIMIT 200`;
   });
   app.get("/api/admin/integrations", async (req) => {
@@ -217,7 +236,7 @@ export async function createApp(
     return db`SELECT * FROM integrations WHERE enabled`;
   });
   app.get("/api/admin/payments/compensations", async (req) => {
-    admin(await actor(db, req));
+    admin(await actor(db, req), "finance");
     return db`SELECT c.*,o.partner_id,o.payment_state,o.total,o.refunded_amount FROM payment_compensations c JOIN orders o ON o.id=c.order_id WHERE c.state<>'succeeded' ORDER BY c.updated_at LIMIT 200`;
   });
   app.get("/api/admin/summary", async (req) => {
@@ -288,7 +307,7 @@ export async function createApp(
   });
   app.get("/api/support", async (req) => {
     const a = await actor(db, req);
-    return a.role === "admin"
+    return a.role === "admin" && a.permissions.includes("support")
       ? db`SELECT * FROM support_tickets ORDER BY created_at DESC LIMIT 200`
       : db`SELECT * FROM support_tickets WHERE customer_id=${a.id} OR partner_id=ANY(${a.partners}::uuid[]) ORDER BY created_at DESC LIMIT 100`;
   });
@@ -312,7 +331,7 @@ export async function createApp(
     if (
       !t ||
       !(
-        a.role === "admin" ||
+        (a.role === "admin" && a.permissions.includes("support")) ||
         t.customer_id === a.id ||
         a.partners.includes(t.partner_id)
       )
@@ -330,7 +349,7 @@ export async function createApp(
     if (
       !t ||
       !(
-        a.role === "admin" ||
+        (a.role === "admin" && a.permissions.includes("support")) ||
         t.customer_id === a.id ||
         a.partners.includes(t.partner_id)
       )

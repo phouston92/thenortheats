@@ -4,8 +4,18 @@ export async function seed(db: Database) {
   await db.begin(async (tx) => {
     for (const name of ["Lancaster", "Morecambe", "Kendal", "Preston"])
       await tx`INSERT INTO towns(name) VALUES(${name}) ON CONFLICT DO NOTHING`;
-    if (process.env.SEED_ADMIN_EMAIL)
-      await tx`INSERT INTO users(email,role) VALUES(${process.env.SEED_ADMIN_EMAIL.toLowerCase()},'admin') ON CONFLICT DO NOTHING`;
+    if (process.env.SEED_ADMIN_EMAIL) {
+      const [created] =
+        await tx`INSERT INTO users(email,role) VALUES(${process.env.SEED_ADMIN_EMAIL.toLowerCase()},'admin') ON CONFLICT DO NOTHING RETURNING id`;
+      if (created)
+        for (const permission of [
+          "operations",
+          "finance",
+          "support",
+          "governance",
+        ])
+          await tx`INSERT INTO admin_permissions VALUES(${created.id},${permission})`;
+    }
     // Demo partners deliberately pending: activation requires an explicit policy, never a global default.
     for (const [id, name, town] of [
       ["10000000-0000-4000-8000-000000000001", "Ember & Stone", "Lancaster"],

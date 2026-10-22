@@ -17,6 +17,7 @@ export type Actor = {
   role: string;
   csrf: string;
   partners: string[];
+  permissions: string[];
 };
 export async function actor(db: Database, req: FastifyRequest): Promise<Actor> {
   const token = req.cookies.north_session;
@@ -35,19 +36,28 @@ export async function actor(db: Database, req: FastifyRequest): Promise<Actor> {
     await db`SELECT partner_id FROM memberships WHERE user_id=${u.id}`;
   return {
     ...u,
+    permissions:
+      u.role === "admin"
+        ? (
+            await db`SELECT permission FROM admin_permissions WHERE user_id=${u.id}`
+          ).map((p) => p.permission)
+        : [],
     partners: ["owner", "operator"].includes(u.role)
       ? memberships.map((x) => x.partner_id)
       : [],
   } as Actor;
 }
-export function admin(a: Actor) {
-  if (a.role !== "admin")
+export function admin(a: Actor, permission: string | null = "operations") {
+  if (a.role !== "admin" || (permission && !a.permissions.includes(permission)))
     throw Object.assign(new Error("Administrator permission required"), {
       statusCode: 403,
     });
 }
 export function tenant(a: Actor, p: string, finance = false) {
-  if (a.role === "admin") return;
+  if (a.role === "admin") {
+    admin(a, finance ? "finance" : "operations");
+    return;
+  }
   if (
     !a.partners.includes(p) ||
     !["owner", "operator"].includes(a.role) ||
@@ -190,7 +200,13 @@ export async function authRoutes(app: FastifyInstance, db: Database) {
   app.get("/api/auth/me", async (req) => {
     const a = await actor(db, req);
     return {
-      user: { id: a.id, email: a.email, role: a.role, partners: a.partners },
+      user: {
+        id: a.id,
+        email: a.email,
+        role: a.role,
+        partners: a.partners,
+        permissions: a.permissions,
+      },
       csrf: a.csrf,
     };
   });

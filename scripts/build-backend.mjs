@@ -4,6 +4,7 @@ await build({
   entryPoints: {
     api: "apps/api/src/server.ts",
     worker: "apps/worker/src/index.ts",
+    migrate: "packages/database/src/migrate.ts",
   },
   outdir: "dist/backend",
   bundle: true,

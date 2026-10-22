@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
-import type { Database } from "../../../packages/database/src/index";
+import { financialEvent, recordFinancialEvent } from "./reconciliation";
+import type { Database, Query } from "../../../packages/database/src/index";
 import { StripeProvider } from "../../../packages/payments/src/index";
 import { settleRefundInTransaction } from "./orders";
 export async function webhookRoutes(app: FastifyInstance, db: Database) {
@@ -13,11 +14,27 @@ export async function webhookRoutes(app: FastifyInstance, db: Database) {
           .send({ error: "Stripe test webhook not configured" });
       let event;
       try {
-        event = new StripeProvider().stripe.webhooks.constructEvent(
-          (req as any).rawBody,
-          req.headers["stripe-signature"] as string,
-          process.env.STRIPE_WEBHOOK_SECRET,
-        );
+        const stripe = new StripeProvider().stripe;
+        const secrets = [process.env.STRIPE_WEBHOOK_SECRET];
+        if (
+          process.env.STRIPE_WEBHOOK_SECRET_PREVIOUS &&
+          Date.parse(process.env.STRIPE_WEBHOOK_PREVIOUS_EXPIRES_AT || "") >
+            Date.now()
+        )
+          secrets.push(process.env.STRIPE_WEBHOOK_SECRET_PREVIOUS);
+        for (const secret of secrets) {
+          try {
+            event = stripe.webhooks.constructEvent(
+              (req as any).rawBody,
+              req.headers["stripe-signature"] as string,
+              secret,
+            );
+            break;
+          } catch {
+            /* Try only the configured overlap key. */
+          }
+        }
+        if (!event) throw new Error("Invalid signature");
       } catch {
         return reply.code(400).send({ error: "Invalid webhook signature" });
       }
@@ -27,9 +44,26 @@ export async function webhookRoutes(app: FastifyInstance, db: Database) {
         const saved =
           await tx`INSERT INTO webhook_events(provider_id,type) VALUES(${event.id},${event.type}) ON CONFLICT DO NOTHING RETURNING provider_id`;
         if (!saved.length) return { received: true, duplicate: true };
+        const isRefund = [
+          "refund.created",
+          "refund.updated",
+          "refund.failed",
+        ].includes(event.type);
+        const local = isRefund
+          ? (
+              await tx`SELECT origin FROM refunds WHERE provider_id=${(event.data.object as any).id} OR (provider_id IS NULL AND request_key=${(event.data.object as any).metadata?.refundRequestKey || ""})`
+            )[0]
+          : null;
+        const financial =
+          !isRefund || local?.origin !== "api" ? financialEvent(event) : null;
+        if (financial) {
+          await recordFinancialEvent(tx, financial);
+          return { received: true };
+        }
         if (
           event.type === "refund.updated" ||
-          event.type === "refund.created"
+          event.type === "refund.created" ||
+          event.type === "refund.failed"
         ) {
           const refund = event.data.object;
           // Metadata recovers a provider success that raced/crashed before its ID was saved.
@@ -55,61 +89,81 @@ export async function webhookRoutes(app: FastifyInstance, db: Database) {
           }
           return { received: true };
         }
-        if (
-          ![
-            "payment_intent.succeeded",
-            "payment_intent.payment_failed",
-            "payment_intent.amount_capturable_updated",
-          ].includes(event.type)
-        )
-          return { received: true };
-        const pi = event.data.object as any;
-        const [p] =
-          await tx`SELECT p.*,o.status AS order_status,o.service_fee FROM payments p JOIN orders o ON o.id=p.order_id WHERE (p.provider_id=${pi.id} OR (p.provider_id IS NULL AND p.order_id::text=${pi.metadata?.orderId || ""})) AND p.stripe_account=${event.account || ""} FOR UPDATE OF p,o`;
-        if (
-          !p ||
-          pi.currency !== "gbp" ||
-          pi.amount !== p.amount ||
-          pi.metadata?.orderId !== p.order_id ||
-          (pi.application_fee_amount ?? 0) !== p.service_fee
-        )
-          throw Object.assign(new Error("Payment reconciliation mismatch"), {
-            statusCode: 409,
-          });
-        const state =
-          event.type === "payment_intent.succeeded"
-            ? "captured"
-            : event.type === "payment_intent.payment_failed"
-              ? "failed"
-              : "authorised";
-        // A delayed failure/authorisation cannot downgrade a successful payment.
-        if (
-          ["captured", "refunded", "partially_refunded"].includes(p.state) &&
-          state !== "captured"
-        )
-          return { received: true };
-        if (state === "captured" && pi.amount_received !== p.amount)
-          throw Object.assign(new Error("Captured amount mismatch"), {
-            statusCode: 409,
-          });
-        // A replay under a new event ID must not restore an already refunded payment.
-        if (["refunded", "partially_refunded"].includes(p.state))
-          return { received: true };
-        await tx`UPDATE payments SET state=${state},provider_id=${pi.id},updated_at=now() WHERE id=${p.id}`;
-        await tx`UPDATE orders SET payment_state=${state} WHERE id=${p.order_id} AND payment_state NOT IN ('refunded','partially_refunded')`;
-        if (state === "captured" && p.order_status === "awaiting_payment") {
-          await tx`UPDATE orders SET status='awaiting_acceptance' WHERE id=${p.order_id}`;
-          await tx`INSERT INTO order_history(order_id,status) VALUES(${p.order_id},'awaiting_acceptance')`;
-          await tx`INSERT INTO notifications(order_id,recipient,kind) SELECT id,partner_id::text,'new_order' FROM orders WHERE id=${p.order_id} ON CONFLICT DO NOTHING`;
-        }
-        if (
-          state === "captured" &&
-          ["cancelled", "rejected"].includes(p.order_status)
-        )
-          await tx`INSERT INTO payment_compensations(order_id) VALUES(${p.order_id}) ON CONFLICT(order_id) DO UPDATE SET state='pending',updated_at=now() WHERE payment_compensations.state='succeeded'`;
-        await tx`INSERT INTO reconciliation_records(provider_id,order_id,amount,state) VALUES(${event.id},${p.order_id},${p.amount},${state}) ON CONFLICT DO NOTHING`;
-        return { received: true };
+        return reconcilePayment(tx, event);
       });
     },
   );
+}
+
+export async function reconcilePayment(
+  tx: Query,
+  event: { id: string; type: string; account?: string; data: { object: any } },
+) {
+  if (
+    ![
+      "payment_intent.succeeded",
+      "payment_intent.payment_failed",
+      "payment_intent.canceled",
+      "payment_intent.amount_capturable_updated",
+    ].includes(event.type)
+  )
+    return { received: true };
+  const pi = event.data.object as any;
+  const [p] =
+    await tx`SELECT p.*,o.status AS order_status,o.service_fee FROM payments p JOIN orders o ON o.id=p.order_id WHERE (p.provider_id=${pi.id} OR (p.provider_id IS NULL AND p.order_id::text=${pi.metadata?.orderId || ""})) AND p.stripe_account=${event.account || ""} FOR UPDATE OF p,o`;
+  if (
+    !p ||
+    pi.currency !== "gbp" ||
+    pi.amount !== p.amount ||
+    pi.metadata?.orderId !== p.order_id ||
+    (pi.application_fee_amount ?? 0) !== p.service_fee
+  )
+    throw Object.assign(new Error("Payment reconciliation mismatch"), {
+      statusCode: 409,
+    });
+  const state =
+    event.type === "payment_intent.succeeded"
+      ? "captured"
+      : ["payment_intent.payment_failed", "payment_intent.canceled"].includes(
+            event.type,
+          )
+        ? "failed"
+        : "authorised";
+  // A delayed failure/authorisation cannot downgrade a successful payment.
+  if (
+    ["captured", "refunded", "partially_refunded"].includes(p.state) &&
+    state !== "captured"
+  )
+    return { received: true };
+  if (state === "captured" && pi.amount_received !== p.amount)
+    throw Object.assign(new Error("Captured amount mismatch"), {
+      statusCode: 409,
+    });
+  // A replay under a new event ID must not restore an already refunded payment.
+  if (["refunded", "partially_refunded"].includes(p.state))
+    return { received: true };
+  const charge =
+    typeof pi.latest_charge === "string"
+      ? pi.latest_charge
+      : pi.latest_charge?.id;
+  if (state === "captured" && charge && p.charge_id && p.charge_id !== charge)
+    throw Object.assign(new Error("Payment charge mismatch"), {
+      statusCode: 409,
+    });
+  if (state === "captured" && charge)
+    await tx`UPDATE payments SET charge_id=${charge} WHERE id=${p.id} AND charge_id IS NULL`;
+  await tx`UPDATE payments SET state=${state},provider_id=${pi.id},updated_at=now() WHERE id=${p.id}`;
+  await tx`UPDATE orders SET payment_state=${state} WHERE id=${p.order_id} AND payment_state NOT IN ('refunded','partially_refunded')`;
+  if (state === "captured" && p.order_status === "awaiting_payment") {
+    await tx`UPDATE orders SET status='awaiting_acceptance' WHERE id=${p.order_id}`;
+    await tx`INSERT INTO order_history(order_id,status) VALUES(${p.order_id},'awaiting_acceptance')`;
+    await tx`INSERT INTO notifications(order_id,recipient,kind) SELECT id,partner_id::text,'new_order' FROM orders WHERE id=${p.order_id} ON CONFLICT DO NOTHING`;
+  }
+  if (
+    state === "captured" &&
+    ["cancelled", "rejected"].includes(p.order_status)
+  )
+    await tx`INSERT INTO payment_compensations(order_id) VALUES(${p.order_id}) ON CONFLICT(order_id) DO UPDATE SET state='pending',updated_at=now() WHERE payment_compensations.state='succeeded'`;
+  await tx`INSERT INTO reconciliation_records(provider_id,order_id,amount,state) VALUES(${event.id},${p.order_id},${p.amount},${state}) ON CONFLICT DO NOTHING`;
+  return { received: true };
 }

@@ -31,4 +31,23 @@ describe("credential encryption and runtime gates", () => {
       config({ ...secure, STRIPE_SECRET_KEY: "sk_live_fixture" }),
     ).toThrow("Live payments");
   });
+  it("rotates named keys without exposing key material in malformed configuration errors", () => {
+    process.env.MFA_ENCRYPTION_KEY = "42".repeat(32);
+    const legacy = encryptMfa("JBSWY3DPEHPK3PXP", "owner");
+    process.env.MFA_ENCRYPTION_KEYS = JSON.stringify({ next: "43".repeat(32) });
+    process.env.MFA_ACTIVE_KEY_ID = "next";
+    try {
+      expect(decryptMfa(legacy, "owner")).toBe("JBSWY3DPEHPK3PXP");
+      const current = encryptMfa("JBSWY3DPEHPK3PXP", "owner");
+      expect(current.startsWith("v1:next:")).toBe(true);
+      expect(decryptMfa(current, "owner")).toBe("JBSWY3DPEHPK3PXP");
+      process.env.MFA_ENCRYPTION_KEYS = '{"sensitive-value"';
+      expect(() => encryptMfa("secret", "owner")).toThrow(
+        "Invalid MFA keyring configuration",
+      );
+    } finally {
+      delete process.env.MFA_ENCRYPTION_KEYS;
+      delete process.env.MFA_ACTIVE_KEY_ID;
+    }
+  });
 });

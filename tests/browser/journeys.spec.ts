@@ -15,6 +15,8 @@ test.beforeAll(async () => {
       await tx`INSERT INTO towns(name) VALUES('Browser Test Town') ON CONFLICT(name) DO UPDATE SET active=true RETURNING id`;
     const [admin] =
       await tx`INSERT INTO users(email,role) VALUES('browser-admin@example.test','admin') ON CONFLICT(email) DO UPDATE SET role='admin' RETURNING id`;
+    for (const permission of ["operations", "finance", "support", "governance"])
+      await tx`INSERT INTO admin_permissions VALUES(${admin.id},${permission}) ON CONFLICT DO NOTHING`;
     await tx`INSERT INTO partners(id,name,town_id) VALUES(${partnerId},'Browser Test Kitchen',${town.id}) ON CONFLICT(id) DO UPDATE SET paused=false`;
     if (
       !(await tx`SELECT id FROM fee_policies WHERE partner_id=${partnerId}`)
@@ -83,6 +85,17 @@ test("administrator signs in with MFA, reviews live dashboard and adds pending p
     .fill("New Kitchen " + Date.now());
   await page.getByRole("button", { name: "Save", exact: true }).click();
   await expect(page.getByRole("status")).toHaveText("Changes saved.");
+  await page.getByRole("button", { name: "Finance", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Stripe reconciliation · test mode" }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Users and Permissions", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Administrator and staff access" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Dashboard", exact: true }).click();
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(
     page.getByRole("button", { name: "Toggle navigation" }),

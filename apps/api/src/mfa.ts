@@ -1,3 +1,4 @@
+import { mfaKeys } from "../../../packages/config/src/mfa-keys";
 import {
   createCipheriv,
   createDecipheriv,
@@ -9,27 +10,35 @@ import type { FastifyInstance } from "fastify";
 import type { Database, Query } from "../../../packages/database/src/index";
 import { actor, admin, audit, hash } from "./auth";
 import { z } from "zod";
-function key() {
-  const value = process.env.MFA_ENCRYPTION_KEY;
-  if (!value || !/^[a-f0-9]{64}$/i.test(value))
-    throw new Error("MFA encryption key required (32 bytes, hex)");
-  return Buffer.from(value, "hex");
-}
 export function encryptMfa(secret: string, userId: string) {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key(), iv);
-  cipher.setAAD(Buffer.from(userId));
-  return Buffer.concat([
+  const ring = mfaKeys(),
+    id = ring.active;
+  const key = Buffer.from(id ? ring.keys[id] : ring.legacy!, "hex"),
+    iv = randomBytes(12),
+    cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(id ? userId + ":v1:" + id : userId));
+  const value = Buffer.concat([
     iv,
     cipher.update(secret, "utf8"),
     cipher.final(),
     cipher.getAuthTag(),
   ]).toString("base64");
+  return id ? "v1:" + id + ":" + value : value;
 }
 export function decryptMfa(value: string, userId: string) {
-  const data = Buffer.from(value, "base64");
-  const cipher = createDecipheriv("aes-256-gcm", key(), data.subarray(0, 12));
-  cipher.setAAD(Buffer.from(userId));
+  const ring = mfaKeys(),
+    parts = value.split(":"),
+    versioned = parts.length === 3 && parts[0] === "v1";
+  const id = versioned ? parts[1] : undefined,
+    key = id ? ring.keys[id] : ring.legacy;
+  if (!key) throw new Error("Required MFA decryption key is unavailable");
+  const data = Buffer.from(versioned ? parts[2] : value, "base64"),
+    cipher = createDecipheriv(
+      "aes-256-gcm",
+      Buffer.from(key, "hex"),
+      data.subarray(0, 12),
+    );
+  cipher.setAAD(Buffer.from(id ? userId + ":v1:" + id : userId));
   cipher.setAuthTag(data.subarray(-16));
   return Buffer.concat([
     cipher.update(data.subarray(12, -16)),
@@ -59,7 +68,7 @@ export const recoveryHash = (userId: string, code: string) =>
 export async function mfaRoutes(app: FastifyInstance, db: Database) {
   app.get("/api/auth/mfa", async (req) => {
     const a = await actor(db, req);
-    admin(a);
+    admin(a, null);
     const [row] =
       await db`SELECT updated_at FROM admin_mfa WHERE user_id=${a.id}`;
     const [codes] =
@@ -72,7 +81,7 @@ export async function mfaRoutes(app: FastifyInstance, db: Database) {
   });
   app.post("/api/auth/mfa/rotate", async (req) => {
     const a = await actor(db, req);
-    admin(a);
+    admin(a, null);
     const { mfa } = z
       .object({ mfa: z.string().regex(/^\d{6}$/) })
       .parse(req.body);
@@ -96,7 +105,7 @@ export async function mfaRoutes(app: FastifyInstance, db: Database) {
   });
   app.post("/api/auth/mfa/confirm", async (req, reply) => {
     const a = await actor(db, req);
-    admin(a);
+    admin(a, null);
     const { mfa } = z
       .object({ mfa: z.string().regex(/^\d{6}$/) })
       .parse(req.body);

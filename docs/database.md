@@ -19,3 +19,11 @@ See requirements-coverage.md for the complete list of entity areas not yet imple
 0006 installs an access-change trigger that revokes sessions on role/disabled changes; 0007 revokes legacy sessions once on upgrade. 0008 adds nullable immutable ledger tax snapshots without changing existing financial rows. New credits store cumulative tax reversals and invoices use explicit snapshots with a legacy fallback. Apply these migrations before running the updated API. Session logout is intentional; business data is not removed.
 
 Migration 0009 adds encrypted individual admin MFA/recovery/rotation records, durable capture and cancellation/refund compensation operations, shared authentication abuse buckets and a Connect onboarding interruption timestamp. It revokes legacy admin sessions once; individual enrollment is required. Apply migrations as the owner, then reapply the explicit runtime grants before starting API/worker. Runtime credentials cannot apply migrations.
+
+## Reconciliation and access migrations
+
+0010 adds immutable provider evidence/balances/dispute adjustments, payout/dispute/fee workflow projections, dashboard refund origin, interrupted-operation checks, four explicit admin permission grants, session revocation and additional tenant constraints/triggers. 0011 records automatic-payout pagination/completion/net matching. 0012 protects grant-role compatibility, clears stale grants on demotion and guards provider financial identity/amount fields. 0013 records settlement availability separately from immutable money.
+
+Migrations append schema/evidence protections; they do not rewrite historical fee/tax/invoice records. Composite ledger/order constraints validate existing data and fail on anomalies. Repeated migration execution remains checksum-protected and idempotent. Apply explicit runtime grants after schema changes; the API image cannot migrate. The separate migration image contains compiled migration logic and SQL without TS/tsx/mobile tooling and must receive only the one-off owner credential.
+
+0014 pins guard-function search paths with pg_temp explicitly last, preventing temporary shadow tables from bypassing tenant/pricing/permission/session protection. A runtime-role regression test attempts that bypass and must fail. No business row is rewritten.

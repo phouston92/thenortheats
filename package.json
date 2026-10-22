@@ -29,7 +29,12 @@
     "build:backend": "node scripts/build-backend.mjs",
     "audit:backend": "node scripts/audit-backend.mjs",
     "admin:mfa": "tsx --env-file-if-exists=.env scripts/admin-mfa.ts",
-    "test:backend-image": "tsx scripts/test-backend-image.ts"
+    "test:backend-image": "tsx scripts/test-backend-image.ts",
+    "admin:rotate-key": "tsx --env-file-if-exists=.env scripts/rotate-mfa-key.ts",
+    "stripe:verify": "tsx --env-file-if-exists=.env scripts/stripe-verify.ts",
+    "test:restore": "tsx scripts/test-restore.ts",
+    "test:web-image": "node scripts/test-web-image.mjs",
+    "test:staging-config": "node scripts/test-staging-config.mjs"
   },
   "devDependencies": {
     "typescript": "5.9.3",

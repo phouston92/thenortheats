@@ -1,5 +1,7 @@
 # Development progress — 22 October 2026
 
+**Current delivery:** [Provider reconciliation and staging preparation](reconciliation-staging-review.md) supersedes earlier follow-up counts and missing-capability statements. No actual Stripe-provider operation or VPS deployment was performed.
+
 **Latest follow-up:** [Payment, security and deployment isolation review](payment-security-review.md) supersedes historical result counts and earlier unfinished MFA/onboarding/container statements below. No external provider verification or deployment is claimed.
 
 Branch: `feature/platform-development-baseline`, based on `main`. No production deployment, live payment or VPS connection. The result is an integrated development baseline; Phases 2–4 are partial. The full brief is **not complete**. See requirements-coverage.md for every major unfinished area.

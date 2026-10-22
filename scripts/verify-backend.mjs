@@ -9,6 +9,8 @@ if (process.getuid() === 0 || forbidden.length)
   throw new Error("Runtime isolation failed: " + JSON.stringify(forbidden));
 for (const file of [
   "/app/.env",
+  "/app/bin/migrate.mjs",
+  "/app/migrations",
   "/app/apps/customer-mobile",
   "/app/node_modules/.bin/tsx",
 ]) {

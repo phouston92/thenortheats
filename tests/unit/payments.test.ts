@@ -276,4 +276,46 @@ describe("Stripe test-only direct charge allocation", () => {
       { stripeAccount: account.id, idempotencyKey: "capture_fixture" },
     );
   });
+  it("reads connected-account reconciliation without creating payments and refuses incomplete pagination", async () => {
+    const p = new StripeProvider("sk_test_fixture");
+    const retrieve = vi
+      .spyOn(p.stripe.paymentIntents, "retrieve")
+      .mockResolvedValue(intentResponse());
+    const list = vi
+      .spyOn(p.stripe.refunds, "list")
+      .mockResolvedValue({
+        object: "list",
+        url: "/v1/refunds",
+        has_more: false,
+        data: [],
+        lastResponse: {
+          headers: {},
+          requestId: "req_fixture",
+          statusCode: 200,
+        },
+      });
+    const create = vi.spyOn(p.stripe.paymentIntents, "create");
+    const snapshot = await p.reconciliationSnapshot(account.id, "pi_existing");
+    expect(snapshot.refunds).toEqual([]);
+    expect(create).not.toHaveBeenCalled();
+    expect(retrieve).toHaveBeenCalledWith(
+      "pi_existing",
+      { expand: ["latest_charge.balance_transaction"] },
+      { stripeAccount: account.id },
+    );
+    expect(list).toHaveBeenCalledWith(
+      { payment_intent: "pi_existing", limit: 100 },
+      { stripeAccount: account.id },
+    );
+    list.mockResolvedValue({
+      object: "list",
+      url: "/v1/refunds",
+      has_more: true,
+      data: [],
+      lastResponse: { headers: {}, requestId: "req_fixture", statusCode: 200 },
+    });
+    await expect(
+      p.reconciliationSnapshot(account.id, "pi_existing"),
+    ).rejects.toThrow("pagination");
+  });
 });

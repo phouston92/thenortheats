@@ -346,6 +346,9 @@ label.check {
 .metric small {
   font-size: 10px;
 }
+.dashboard-grid > * {
+  min-width: 0;
+}
 .dashboard-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 290px;
@@ -694,7 +697,7 @@ td small {
     grid-template-columns: repeat(2, 1fr);
   }
   .dashboard-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .restaurant-grid {
     grid-template-columns: repeat(2, 1fr);
@@ -755,7 +758,7 @@ td small {
     gap: 0;
   }
   .split-form {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .restaurant-grid,
   .customer-columns {

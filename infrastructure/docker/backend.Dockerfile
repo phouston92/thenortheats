@@ -20,8 +20,21 @@ FROM node:24.19.0-bookworm-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production PORT=3001
 COPY --from=build --chown=node:node /runtime/node_modules ./node_modules
-COPY --from=build --chown=node:node /build/dist/backend/*.mjs ./
+COPY --from=build --chown=node:node /build/dist/backend/api.mjs /build/dist/backend/worker.mjs ./
+COPY --chown=node:node scripts/runtime-env.mjs ./runtime-env.mjs
 USER node
 EXPOSE 3001
 HEALTHCHECK --interval=30s --timeout=3s CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["node", "api.mjs"]
+ENTRYPOINT ["node", "runtime-env.mjs"]
+CMD ["api"]
+
+# Separate one-off schema-owner job; never grant its credential to API/worker.
+FROM runtime AS migration
+COPY --from=build --chown=node:node /build/dist/backend/migrate.mjs ./bin/migrate.mjs
+COPY --from=build --chown=node:node /build/packages/database/migrations ./migrations
+COPY --chown=node:node scripts/migration-env.mjs ./migration-env.mjs
+ENTRYPOINT ["node", "migration-env.mjs"]
+CMD []
+
+# Default target is the application runtime, excluding migration tooling/SQL.
+FROM runtime AS release

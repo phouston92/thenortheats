@@ -1,8 +1,18 @@
+import { fileURLToPath } from "node:url";
 export default (phase) => ({
   distDir:
     process.env.NEXT_DIST_DIR ||
     (phase === "phase-development-server" ? ".next-dev" : ".next"),
   transpilePackages: [],
+  logging: { incomingRequests: false },
+  output: "standalone",
+  outputFileTracingExcludes: {
+    "/*": [
+      "**/node_modules/typescript/**",
+      "**/node_modules/.pnpm/typescript@*/**",
+    ],
+  },
+  outputFileTracingRoot: fileURLToPath(new URL("../../", import.meta.url)),
   async headers() {
     return [
       {
@@ -15,11 +25,6 @@ export default (phase) => ({
             value: "camera=(), microphone=(), geolocation=()",
           },
           { key: "X-Frame-Options", value: "DENY" },
-          {
-            key: "Content-Security-Policy",
-            value:
-              "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; frame-src https://js.stripe.com https://hooks.stripe.com;",
-          },
           ...(process.env.COOKIE_SECURE === "true"
             ? [{ key: "Strict-Transport-Security", value: "max-age=31536000" }]
             : []),

@@ -24,7 +24,7 @@ export class StripeProvider implements PaymentProvider {
   constructor(key = process.env.STRIPE_SECRET_KEY) {
     if (!key?.startsWith("sk_test_"))
       throw new Error("Stripe test key required; production disabled");
-    this.stripe = new Stripe(key);
+    this.stripe = new Stripe(key, { maxNetworkRetries: 2, timeout: 10000 });
   }
   async ready(account: string) {
     const a = await this.stripe.accounts.retrieve(account);
@@ -115,6 +115,57 @@ export class StripeProvider implements PaymentProvider {
       { stripeAccount: account, idempotencyKey: key },
     );
     return { id: r.id, status: r.status || "pending" };
+  }
+  async reconciliationSnapshot(account: string, intentId: string) {
+    const options = { stripeAccount: account };
+    const intent = await this.stripe.paymentIntents.retrieve(
+      intentId,
+      { expand: ["latest_charge.balance_transaction"] },
+      options,
+    );
+    if (intent.livemode) throw new Error("Live provider object disabled");
+    const charge =
+      typeof intent.latest_charge === "object" ? intent.latest_charge : null;
+    const refunds = await this.stripe.refunds.list(
+      { payment_intent: intentId, limit: 100 },
+      options,
+    );
+    const disputes = charge
+      ? await this.stripe.disputes.list(
+          { charge: charge.id, limit: 100 },
+          options,
+        )
+      : { data: [], has_more: false };
+    if (refunds.has_more || disputes.has_more)
+      throw new Error(
+        "Provider pagination requires explicit account reconciliation; snapshot incomplete",
+      );
+    return { intent, charge, refunds: refunds.data, disputes: disputes.data };
+  }
+  async payoutSnapshot(account: string, payoutId: string, cursor?: string) {
+    const options = { stripeAccount: account };
+    const payout = await this.stripe.payouts.retrieve(payoutId, {}, options);
+    if (payout.livemode) throw new Error("Live provider object disabled");
+    if (payout.automatic && payout.reconciliation_status !== "completed")
+      throw new Error(
+        "Stripe payout reconciliation is not complete; retry after provider completion",
+      );
+    const balances = payout.automatic
+      ? await this.stripe.balanceTransactions.list(
+          {
+            payout: payout.id,
+            limit: 100,
+            ...(cursor ? { starting_after: cursor } : {}),
+          },
+          options,
+        )
+      : { data: [], has_more: false };
+    return {
+      payout,
+      balances: balances.data,
+      hasMore: balances.has_more,
+      nextCursor: balances.has_more ? balances.data.at(-1)?.id : null,
+    };
   }
   async createAccount(partnerId: string) {
     return this.stripe.accounts.create(

@@ -1,3 +1,5 @@
+import { ReconciliationPanel } from "./reconciliation-panel";
+import { AccessManagement } from "./access-management";
 import { MfaManagement } from "./mfa-management";
 import React, { useState, useEffect, useCallback } from "react";
 import { createRoot } from "react-dom/client";
@@ -48,6 +50,17 @@ const nav = [
   ["Audit Logs", ScrollText],
   ["Platform Settings", Settings],
 ] as const;
+function allowedPage(page: string, user: any) {
+  if (page === "Platform Settings") return true;
+  const scope = ["Finance", "Billing"].includes(page)
+    ? "finance"
+    : page === "Helpdesk"
+      ? "support"
+      : ["Users and Permissions", "Audit Logs"].includes(page)
+        ? "governance"
+        : "operations";
+  return user?.permissions?.includes(scope);
+}
 function App() {
   const { user, setUser } = useSession();
   const [page, setPage] = useState("Dashboard");
@@ -61,11 +74,20 @@ function App() {
   const [selected, setSelected] = useState<any>(null);
   const [search, setSearch] = useState("");
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (user?.role === "admin" && !allowedPage(page, user))
+      setPage(
+        nav.find(([label]) => allowedPage(label, user))?.[0] ||
+          "Platform Settings",
+      );
+  }, [user, page]);
   const load = useCallback(async () => {
-    if (user?.role !== "admin") return;
+    if (user?.role !== "admin" || !allowedPage(page, user)) return;
     setError("");
     try {
-      const [t, p] = await Promise.all([api("/towns"), api("/admin/partners")]);
+      const [t, p] = user.permissions?.includes("operations")
+        ? await Promise.all([api("/towns"), api("/admin/partners")])
+        : [[], []];
       setTowns(t);
       setPartners(p);
       const paths: Record<string, string> = {
@@ -256,20 +278,22 @@ function App() {
       <aside className={"sidebar " + (open ? "open" : "")}>
         <div className="nav-label">WORKSPACE</div>
         <nav aria-label="Administration">
-          {nav.map(([label, Icon]) => (
-            <button
-              key={label}
-              className={page === label ? "active" : ""}
-              onClick={() => navigate(label)}
-              aria-current={page === label ? "page" : undefined}
-            >
-              <Icon />
-              {label}
-              {["Promotions", "Platform Settings"].includes(label) && (
-                <span className="nav-dot">PLANNED</span>
-              )}
-            </button>
-          ))}
+          {nav
+            .filter(([label]) => allowedPage(label, user))
+            .map(([label, Icon]) => (
+              <button
+                key={label}
+                className={page === label ? "active" : ""}
+                onClick={() => navigate(label)}
+                aria-current={page === label ? "page" : undefined}
+              >
+                <Icon />
+                {label}
+                {["Promotions", "Platform Settings"].includes(label) && (
+                  <span className="nav-dot">PLANNED</span>
+                )}
+              </button>
+            ))}
         </nav>
         <div className="sidebar-footer">
           <div>
@@ -847,6 +871,8 @@ function App() {
                 )}
               </section>
             )}
+            {page === "Finance" && <ReconciliationPanel />}
+            {page === "Users and Permissions" && <AccessManagement />}
             {["Finance", "Billing"].includes(page) && data && (
               <>
                 <p className="notice">
@@ -1082,9 +1108,10 @@ function App() {
                     require an authenticator code at sign-in.
                   </p>
                   <p className="notice">
-                    Custom roles, administrator provisioning, delegated support
-                    access are not implemented. Per-user MFA is managed under
-                    Platform Settings. There is no impersonation endpoint.
+                    Four explicit administrator scopes are managed above.
+                    Granular partner roles and delegated support access remain
+                    planned. Per-user MFA is managed under Platform Settings.
+                    There is no impersonation endpoint.
                   </p>
                 </div>
               </section>

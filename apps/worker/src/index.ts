@@ -1,3 +1,4 @@
+import { replayFinancialEvents } from "../../api/src/reconciliation";
 import { validateRuntimeDatabase } from "../../../packages/database/src/runtime-security";
 import { processCompensations } from "../../api/src/compensation";
 import { StripeProvider } from "../../../packages/payments/src/index";
@@ -12,6 +13,7 @@ const queue = new Queue("north-outbox", { connection });
 const worker = new Worker(
   "north-outbox",
   async () => {
+    await replayFinancialEvents(db);
     if (process.env.STRIPE_SECRET_KEY)
       await processCompensations(db, new StripeProvider());
     await db`DELETE FROM auth_rate_limits WHERE expires_at<now()-interval '1 day'`;
@@ -58,8 +60,21 @@ worker.on("failed", () =>
     "Notification delivery attempt failed; inspect provider availability",
   ),
 );
+const heartbeatKey =
+  "north:worker:" +
+  (process.env.NORTH_INSTANCE || process.env.NODE_ENV || "development");
+const heartbeat = setInterval(() => {
+  void queue.client
+    .then((client) => client.set(heartbeatKey, String(Date.now()), "EX", 30))
+    .catch(() => {});
+}, 10000);
+heartbeat.unref();
+void queue.client.then((client) =>
+  client.set(heartbeatKey, String(Date.now()), "EX", 30),
+);
 for (const signal of ["SIGINT", "SIGTERM"])
   process.on(signal, async () => {
+    clearInterval(heartbeat);
     await worker.close();
     await queue.close();
     await db.end();

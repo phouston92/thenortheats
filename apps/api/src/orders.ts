@@ -233,7 +233,7 @@ export async function orderRoutes(
     if (!allowed && req.cookies.north_session) {
       const a = await actor(db, req);
       allowed =
-        a.role === "admin" ||
+        (a.role === "admin" && a.permissions.includes("operations")) ||
         o.customer_id === a.id ||
         (["owner", "operator"].includes(a.role) &&
           a.partners.includes(o.partner_id));
@@ -354,7 +354,7 @@ export async function orderRoutes(
     };
   });
   app.get("/api/admin/finance", async (req) => {
-    admin(await actor(db, req));
+    admin(await actor(db, req), "finance");
     return {
       ledger:
         await db`SELECT l.*,p.name AS partner FROM ledger_entries l JOIN partners p ON p.id=l.partner_id ORDER BY l.created_at DESC LIMIT 200`,
@@ -364,7 +364,7 @@ export async function orderRoutes(
   });
   app.post("/api/admin/invoices", async (req) => {
     const a = await actor(db, req);
-    admin(a);
+    admin(a, "finance");
     const v = z
       .object({ partnerId: id, periodStart: z.iso.date() })
       .parse(req.body);
@@ -386,7 +386,7 @@ export async function orderRoutes(
   });
   app.post("/api/admin/orders/:id/refund", async (req) => {
     const a = await actor(db, req);
-    admin(a);
+    admin(a, "finance");
     const orderId = id.parse((req.params as any).id);
     const v = z
       .object({
@@ -419,6 +419,12 @@ export async function orderRoutes(
         o.payment_state !== "partially_refunded"
       )
         throw fail("Payment is not refundable");
+      const [dispute] =
+        await tx`SELECT provider_id FROM provider_disputes WHERE order_id=${o.id} AND status NOT IN ('won','prevented','warning_closed')`;
+      if (dispute)
+        throw fail(
+          "Disputed payment requires provider reconciliation before another refund",
+        );
       const [pending] =
         await tx`SELECT id FROM refunds WHERE order_id=${o.id} AND status='pending'`;
       if (pending) throw fail("Refund operation pending; reconcile it first");

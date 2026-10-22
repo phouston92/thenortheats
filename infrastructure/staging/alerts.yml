@@ -1,0 +1,15 @@
+groups:
+  - name: north-readiness
+    rules:
+      - alert: NorthAPIDown
+        expr: up{job="north-api"} == 0
+        for: 1m
+      - alert: NorthDependencyUnavailable
+        expr: north_database_up == 0 or north_redis_up == 0 or north_worker_up == 0
+        for: 1m
+      - alert: NorthFinancialReconciliationBlocked
+        expr: north_reconciliation_blocked > 0 or north_compensation_blocked > 0 or north_payout_mismatches > 0
+        for: 5m
+      - alert: NorthFinancialReconciliationPending
+        expr: north_reconciliation_pending > 0
+        for: 15m

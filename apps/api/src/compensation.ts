@@ -36,6 +36,12 @@ export async function compensateOrder(
       await db`UPDATE payment_compensations SET state='succeeded',last_error=NULL,updated_at=now() WHERE order_id=${orderId}`;
       return;
     }
+    const [dispute] =
+      await db`SELECT provider_id FROM provider_disputes WHERE order_id=${orderId} AND status NOT IN ('won','prevented','warning_closed')`;
+    if (dispute) {
+      await db`UPDATE payment_compensations SET state='blocked',last_error='dispute_requires_reconciliation' WHERE order_id=${orderId}`;
+      return;
+    }
     const reservation = await db.begin(async (tx) => {
       const [o] = await tx`SELECT * FROM orders WHERE id=${orderId} FOR UPDATE`;
       if (o.refunded_amount === o.total) return null;
